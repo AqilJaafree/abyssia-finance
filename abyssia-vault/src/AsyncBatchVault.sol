@@ -44,6 +44,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     mapping(uint256 batchId => mapping(address user => uint256)) public depositRequestOf;
     mapping(uint256 batchId => mapping(address user => uint256)) public redeemRequestOf;
 
+    /// @notice USDC that is part of NAV and not deployed. Tracked internally (never read
+    /// from balanceOf), so donations cannot move the share price; see sweepSurplus.
+    uint256 public idleAssets;
     /// @notice USDC held for the open batch's deposit requests — not yet part of NAV.
     uint256 public pendingDepositAssets;
     /// @notice USDC owed to settled-but-unclaimed redemptions — no longer part of NAV.
@@ -73,6 +76,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     event MinDepositSet(uint256 value);
     event MaxTotalAssetsSet(uint256 value);
     event MaxCycleMoveBpsSet(uint256 value);
+    event SurplusSwept(address indexed to, uint256 surplus);
 
     error AsyncOnly();
     error AssetNotSixDecimals();
@@ -87,6 +91,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     error InsufficientIdle(uint256 needed, uint256 available);
     error ParamOutOfBounds();
     error NotLower();
+    error PriceNotAsExpected(uint256 expectedPrice, uint256 livePrice);
+    error SharesToVaultNotAllowed();
 
     constructor(
         IERC20 asset_,
@@ -127,7 +133,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @notice NAV: idle USDC (excluding open deposit requests and settled-unclaimed
     /// redemptions) plus whatever the subclass has deployed.
     function totalAssets() public view override returns (uint256) {
-        return _idleAssets() + _deployedValue();
+        return idleAssets + _deployedValue();
     }
 
     // Synchronous ERC-4626 entry points are disabled; use the request/settle/claim flow.
@@ -197,6 +203,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     }
 
     /// @notice Withdraw your whole deposit request from the open (unsettled) batch.
+    /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
     function cancelDepositRequest() external nonReentrant {
         uint256 id = currentBatchId;
         uint256 assets = depositRequestOf[id][msg.sender];
@@ -211,13 +218,16 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     function requestRedeem(uint256 shares) external nonReentrant whenNotPaused {
         if (shares == 0) revert ZeroAmount();
         uint256 id = currentBatchId;
-        _transfer(msg.sender, address(this), shares); // escrow until settlement
+        // Escrow until settlement. Calls ERC20._update directly: the vault's own
+        // escrow is the only path allowed to move shares into the vault (see _update).
+        ERC20._update(msg.sender, address(this), shares);
         redeemRequestOf[id][msg.sender] += shares;
         batches[id].redeemShares += shares.toUint128();
         emit RedeemRequested(msg.sender, id, shares);
     }
 
     /// @notice Take back your whole redeem request from the open (unsettled) batch.
+    /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
     function cancelRedeemRequest() external nonReentrant {
         uint256 id = currentBatchId;
         uint256 shares = redeemRequestOf[id][msg.sender];
@@ -233,28 +243,49 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     // ---------------------------------------------------------------------
 
     /// @notice Settle the open batch at the current share price. Reverts if the price
-    /// moved more than maxCycleMoveBps since the last settlement.
+    /// moved more than maxCycleMoveBps since the last settlement. The guard is skipped
+    /// on the first settlement and whenever the share supply is zero.
+    /// @dev Requests in the open batch can be cancelled until this lands (a later plan
+    /// may add a pre-settlement cancel cutoff).
     function settle() external onlyRole(KEEPER_ROLE) {
-        _settle(false);
+        _settle(false, 0, 0);
     }
 
     /// @notice Settle even though the price moved more than maxCycleMoveBps — for a
-    /// genuine market move (e.g. a crash) the guardian has reviewed.
-    function settleAcceptingPriceMove() external onlyRole(GUARDIAN_ROLE) {
-        _settle(true);
+    /// genuine market move (e.g. a crash) the guardian has reviewed. Bounded: reverts
+    /// unless the live price is within `toleranceBps` of the `expectedPrice` the guardian
+    /// reviewed, so the override cannot accept whatever price exists when the tx lands.
+    /// @dev Requests in the open batch can be cancelled until this lands.
+    function settleAcceptingPriceMove(uint256 expectedPrice, uint256 toleranceBps)
+        external
+        onlyRole(GUARDIAN_ROLE)
+    {
+        if (expectedPrice == 0 || toleranceBps > maxCycleMoveBps) revert ParamOutOfBounds();
+        _settle(true, expectedPrice, toleranceBps);
     }
 
-    function _settle(bool acceptLargeMove) private nonReentrant whenNotPaused {
+    function _settle(bool guardianOverride, uint256 expectedPrice, uint256 toleranceBps)
+        private
+        nonReentrant
+        whenNotPaused
+    {
         _beforeSettle();
 
         uint256 id = currentBatchId;
         Batch storage b = batches[id];
 
         uint256 price = _sharePrice();
-        uint256 last = lastSharePrice;
-        if (last != 0 && !acceptLargeMove) {
-            uint256 diff = price > last ? price - last : last - price;
-            if (diff * BPS > last * maxCycleMoveBps) revert PriceMoveTooLarge(last, price);
+        if (guardianOverride) {
+            uint256 diff = price > expectedPrice ? price - expectedPrice : expectedPrice - price;
+            if (diff * BPS > expectedPrice * toleranceBps) revert PriceNotAsExpected(expectedPrice, price);
+        } else {
+            uint256 last = lastSharePrice;
+            // No guard on the first settlement, nor once the vault has emptied (supply 0):
+            // the last price no longer describes any outstanding shares.
+            if (last != 0 && totalSupply() != 0) {
+                uint256 diff = price > last ? price - last : last - price;
+                if (diff * BPS > last * maxCycleMoveBps) revert PriceMoveTooLarge(last, price);
+            }
         }
 
         // Both sides convert at the same pre-batch NAV / supply, i.e. one price.
@@ -263,12 +294,14 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
         // Deposits join NAV; their shares wait in the vault until claimed.
         pendingDepositAssets -= b.depositAssets;
+        idleAssets += b.depositAssets;
         if (depositShares > 0) _mint(address(this), depositShares);
 
         if (b.redeemShares > 0) {
             _ensureIdle(redeemAssets);
-            uint256 idle = _idleAssets();
+            uint256 idle = idleAssets;
             if (redeemAssets > idle) revert InsufficientIdle(redeemAssets, idle);
+            idleAssets = idle - redeemAssets;
             _burn(address(this), b.redeemShares);
             claimableAssets += redeemAssets;
         }
@@ -316,10 +349,15 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @notice Burn `shares` and receive the same fraction of everything the vault
     /// holds: idle USDC now, plus each position's share via the subclass hook.
     /// Needs no price, so there is nothing to manipulate.
+    /// @dev Read-only reentrancy: while `_redeemPositionsInKind` makes its external calls,
+    /// shares are already burned and idle reduced but positions not yet transferred, so
+    /// views (`totalAssets`, `sharePrice`) can read high. Integrators must not price off
+    /// this vault mid-call.
     function redeemInKind(uint256 shares, address receiver) external nonReentrant returns (uint256 idleOut) {
         if (shares == 0) revert ZeroAmount();
         uint256 supply = totalSupply();
-        idleOut = _idleAssets().mulDiv(shares, supply, Math.Rounding.Floor);
+        idleOut = idleAssets.mulDiv(shares, supply, Math.Rounding.Floor);
+        idleAssets -= idleOut;
         _burn(msg.sender, shares);
         _redeemPositionsInKind(shares, supply, receiver);
         if (idleOut > 0) IERC20(asset()).safeTransfer(receiver, idleOut);
@@ -355,8 +393,25 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         _pause();
     }
 
+    /// @notice Admin-only (timelocked), so a guardian pause halts requests and settlement
+    /// for at least the timelock delay. Claims, cancels and in-kind exits stay open.
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
+    }
+
+    /// @notice Send out USDC the vault holds beyond its accounting (donations, stray
+    /// transfers): balance − idleAssets − pendingDepositAssets − claimableAssets.
+    function sweepSurplus(address to)
+        external
+        nonReentrant
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        returns (uint256 surplus)
+    {
+        if (to == address(0)) revert ZeroAddress();
+        surplus =
+            IERC20(asset()).balanceOf(address(this)) - idleAssets - pendingDepositAssets - claimableAssets;
+        IERC20(asset()).safeTransfer(to, surplus);
+        emit SurplusSwept(to, surplus);
     }
 
     function _setMinDeposit(uint256 value) private {
@@ -384,8 +439,26 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         return _convertToAssets(10 ** decimals(), Math.Rounding.Floor);
     }
 
-    function _idleAssets() internal view returns (uint256) {
-        return IERC20(asset()).balanceOf(address(this)) - pendingDepositAssets - claimableAssets;
+    /// @dev Credit USDC that became idle through vault accounting (positions unwound,
+    /// fees collected into USDC). The USDC must already be held by the vault.
+    function _increaseIdle(uint256 assets) internal {
+        idleAssets += assets;
+    }
+
+    /// @dev Debit idle USDC leaving NAV-idle (e.g. deployed into LP). Subclasses must
+    /// route every such outflow through here.
+    function _decreaseIdle(uint256 assets) internal {
+        uint256 idle = idleAssets;
+        if (assets > idle) revert InsufficientIdle(assets, idle);
+        idleAssets = idle - assets;
+    }
+
+    /// @dev Shares may only enter the vault through its own paths: minting at settlement
+    /// (`from == 0`) and the requestRedeem escrow (which calls ERC20._update directly).
+    /// Any other transfer to the vault would orphan the shares forever.
+    function _update(address from, address to, uint256 value) internal override {
+        if (to == address(this) && from != address(0)) revert SharesToVaultNotAllowed();
+        super._update(from, to, value);
     }
 
     // ---------------------------------------------------------------------
@@ -395,10 +468,13 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @dev USDC value of everything deployed outside the idle balance (LP positions, token inventory).
     function _deployedValue() internal view virtual returns (uint256);
 
-    /// @dev Make at least `assets` idle USDC available (unwind positions). Called before paying redemptions.
+    /// @dev Make at least `assets` idle USDC available (unwind positions, crediting the
+    /// proceeds via `_increaseIdle`). Called before paying redemptions. If it does not free
+    /// enough idle the whole batch reverts, so adapters must always be able to fully unwind.
     function _ensureIdle(uint256 assets) internal virtual;
 
     /// @dev Transfer `shares / supply` of every deployed position to `receiver`.
+    /// `supply` is the total supply BEFORE `shares` were burned.
     function _redeemPositionsInKind(uint256 shares, uint256 supply, address receiver) internal virtual;
 
     /// @dev Runs at the start of every settlement (fee accrual goes here).

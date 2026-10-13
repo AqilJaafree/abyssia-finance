@@ -20,6 +20,14 @@ contract AsyncBatchVaultHarness is AsyncBatchVault {
         deployedValue = v;
     }
 
+    function harnessIncreaseIdle(uint256 a) external {
+        _increaseIdle(a);
+    }
+
+    function harnessDecreaseIdle(uint256 a) external {
+        _decreaseIdle(a);
+    }
+
     function _deployedValue() internal view override returns (uint256) {
         return deployedValue;
     }

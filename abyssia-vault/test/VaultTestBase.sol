@@ -30,6 +30,13 @@ abstract contract VaultTestBase is Test {
         vm.stopPrank();
     }
 
+    /// @dev A real NAV gain (e.g. fees collected into USDC): the USDC arrives and is
+    /// credited to idle through vault accounting. A bare transfer would be a donation.
+    function _gain(uint256 amount) internal {
+        usdc.mint(address(vault), amount);
+        vault.harnessIncreaseIdle(amount);
+    }
+
     function _settle() internal {
         vm.prank(keeper);
         vault.settle();
