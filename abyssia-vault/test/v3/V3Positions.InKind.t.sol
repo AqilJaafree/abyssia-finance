@@ -8,6 +8,8 @@ import {V3Positions} from "../../src/v3/V3Positions.sol";
 import {IUniswapV3Pool} from "../../src/interfaces/IUniswapV3Pool.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockFreezableERC20} from "../mocks/MockFreezableERC20.sol";
+import {MockGasBurnerERC20} from "../mocks/MockGasBurnerERC20.sol";
+import {Vm} from "forge-std/Vm.sol";
 
 /// @dev The per-position in-kind exit pattern (harness `inKindExit`) against tokens
 /// that refuse transfers, plus slice validation, tick-boundary valuation and the
@@ -67,6 +69,8 @@ contract V3PositionsInKindTest is V3TestBase {
         assertGt(owedUsdc, 0);
         assertEq(hostile.balanceOf(address(harness)) - hostileBefore, owedHostile);
         assertEq(usdc.balanceOf(address(harness)) - usdcBefore, owedUsdc);
+        assertEq(harness.owedTotal(address(hostile)), owedHostile);
+        assertEq(harness.owedTotal(address(usdc)), owedUsdc);
         // The MEME position still paid the receiver directly.
         assertGt(meme.balanceOf(receiver), 0);
         uint256 usdcDirect = usdc.balanceOf(receiver);
@@ -75,6 +79,7 @@ contract V3PositionsInKindTest is V3TestBase {
         harness.claimOwed(address(usdc));
         assertEq(usdc.balanceOf(receiver), usdcDirect + owedUsdc);
         assertEq(harness.owed(receiver, address(usdc)), 0);
+        assertEq(harness.owedTotal(address(usdc)), 0);
 
         vm.expectRevert(abi.encodeWithSelector(MockFreezableERC20.Blocked.selector, receiver));
         harness.claimOwed(address(hostile));
@@ -86,27 +91,140 @@ contract V3PositionsInKindTest is V3TestBase {
         harness.claimOwed(address(hostile));
         assertEq(hostile.balanceOf(receiver), owedHostile);
         assertEq(harness.owed(receiver, address(hostile)), 0);
+        assertEq(harness.owedTotal(address(hostile)), 0);
     }
 
-    /// (c) withdrawSlice rejects a zero supply and shares above supply.
+    /// (c) withdrawSlice rejects a zero supply and shares above supply (reached through a
+    /// correctly bound self-call).
     function test_withdrawSliceRejectsInvalidSlice() public {
-        vm.startPrank(address(harness));
         vm.expectRevert(V3Positions.InvalidSlice.selector);
-        harness.sliceTo(memeId, 0, 0, receiver);
+        harness.probeBoundSelfSlice(0, 0, receiver, memeId, 0, 0, receiver, receiver);
         vm.expectRevert(V3Positions.InvalidSlice.selector);
-        harness.sliceTo(memeId, 5, 4, receiver);
+        harness.probeBoundSelfSlice(5, 4, receiver, memeId, 5, 4, receiver, receiver);
         vm.expectRevert(abi.encodeWithSelector(V3Positions.UnknownPosition.selector, 999));
-        harness.sliceTo(999, 1, 4, receiver);
-        vm.stopPrank();
+        harness.probeBoundSelfSlice(1, 4, receiver, 999, 1, 4, receiver, receiver);
     }
 
     /// (d) The self-call entrypoint is closed to everyone but the vault itself.
     function test_sliceToRejectsExternalCallers() public {
         vm.expectRevert(V3PositionsHarness.OnlySelf.selector);
-        harness.sliceTo(memeId, 1, 4, receiver);
+        harness.sliceTo(memeId, 1, 4, receiver, receiver);
         vm.prank(receiver);
         vm.expectRevert(V3PositionsHarness.OnlySelf.selector);
-        harness.sliceTo(memeId, 1, 4, receiver);
+        harness.sliceTo(memeId, 1, 4, receiver, receiver);
+    }
+
+    /// (e) A self-call outside any exit has no binding and is rejected.
+    function test_sliceToRejectsUnboundSelfCall() public {
+        vm.expectRevert(V3PositionsHarness.UnboundSlice.selector);
+        harness.probeUnboundSelfSlice(memeId, 1, 4, receiver);
+        assertEq(_liquidity(memeId), memeLiq);
+    }
+
+    /// (f) A self-call whose shares / supply / receiver differ from the exit in progress,
+    /// or that targets a third-party recipient, is rejected.
+    function test_sliceToRejectsMismatchedBinding() public {
+        address other = makeAddr("other");
+        vm.expectRevert(V3PositionsHarness.UnboundSlice.selector);
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 2, 4, receiver, receiver); // shares
+        vm.expectRevert(V3PositionsHarness.UnboundSlice.selector);
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 1, 2, receiver, receiver); // supply
+        vm.expectRevert(V3PositionsHarness.UnboundSlice.selector);
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 1, 4, other, other); // receiver
+        vm.expectRevert(V3PositionsHarness.UnboundSlice.selector);
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 1, 4, receiver, other); // recipient
+        assertEq(_liquidity(memeId), memeLiq);
+        // Sanity: a matching binding passes, to the receiver or to the vault itself.
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 1, 4, receiver, receiver);
+        harness.probeBoundSelfSlice(1, 4, receiver, memeId, 1, 4, receiver, address(harness));
+        assertLt(_liquidity(memeId), memeLiq);
+    }
+
+    /// (g) A token that burns all gas on transfer: its slice attempt is capped at
+    /// SLICE_GAS, detected as out-of-gas (no fallback attempt), skipped, and every other
+    /// position still pays out.
+    function test_gasBurnerIsSkippedWithBoundedGas() public {
+        MockGasBurnerERC20 burner = new MockGasBurnerERC20("Burner", "BURN");
+        (uint256 burnerId, uint128 burnerLiq) = _openUsdcPool(address(burner), 1_000e6);
+        burner.setBurn(true);
+        uint256 hostileReceived = hostile.balanceOf(receiver);
+
+        vm.expectEmit(true, false, false, false, address(harness));
+        emit SliceSkipped(burnerId);
+        // The OOG skip means the vault-recipient fallback is never attempted.
+        vm.expectCall(
+            address(harness),
+            abi.encodeCall(harness.sliceTo, (burnerId, 1, 4, receiver, address(harness))),
+            uint64(0)
+        );
+        uint256 g = gasleft();
+        harness.inKindExit{gas: 20_000_000}(1, 4, receiver);
+        uint256 used = g - gasleft();
+        emit log_named_uint("inKindExit gas (3 positions, 1 gas burner)", used);
+
+        // Uncapped, the burner alone would take 63/64 of the 20M forwarded (~19.7M).
+        // Capped: the burner costs one SLICE_GAS (500k) + call overhead, the two honest
+        // slices ~200-250k each. 12.5M is the worst case of MAX_POSITIONS (25) burners at
+        // SLICE_GAS each; this 3-position exit must also stay under a tight
+        // SLICE_GAS + 2 x 400k bound, which a second (fallback) burner attempt would break.
+        assertLt(used, 12_500_000);
+        assertLt(used, harness.SLICE_GAS() + 2 * 400_000);
+        // Burner position untouched; the others paid the receiver.
+        assertEq(_liquidity(burnerId), burnerLiq);
+        assertEq(_liquidity(memeId), memeLiq - memeLiq / 4);
+        assertEq(_liquidity(hostileId), hostileLiq - hostileLiq / 4);
+        assertGt(meme.balanceOf(receiver), 0);
+        assertGt(hostile.balanceOf(receiver), hostileReceived);
+        assertEq(harness.owedTotal(address(burner)), 0);
+    }
+
+    /// (h) EIP-150 guard: a caller sending too little gas gets a revert, never a silent
+    /// skip of slices that would have succeeded with more gas.
+    function test_insufficientGasRevertsNotSkips() public {
+        (bool ok, bytes memory ret) =
+            address(harness).call{gas: 300_000}(abi.encodeCall(harness.inKindExit, (1, 4, receiver)));
+        assertFalse(ok);
+        assertEq(bytes4(ret), V3PositionsHarness.InsufficientGasForSlice.selector);
+        assertEq(_liquidity(memeId), memeLiq);
+        assertEq(_liquidity(hostileId), hostileLiq);
+    }
+
+    /// (i) Fee-on-transfer + blocked receiver: the IOU is what the vault actually
+    /// received (balance delta), not what the position manager reported collecting.
+    function test_feeOnTransferIouIsBalanceDelta() public {
+        hostile.setBlocked(receiver, true);
+        hostile.setFeeBps(1000); // 10%
+        uint256 before = hostile.balanceOf(address(harness));
+
+        vm.recordLogs();
+        harness.inKindExit(1, 4, receiver);
+        uint256 reported = _reportedToVault(hostileId);
+
+        uint256 received = hostile.balanceOf(address(harness)) - before;
+        uint256 iou = harness.owed(receiver, address(hostile));
+        assertGt(received, 0);
+        assertEq(iou, received);
+        assertEq(harness.owedTotal(address(hostile)), received);
+        assertLt(iou, reported);
+        assertApproxEqAbs(iou, reported - reported / 10, 1);
+    }
+
+    /// @dev Amount of HOSTILE the position manager reported sending to the vault for
+    /// `tokenId` (from the library's V3LiquidityWithdrawn event).
+    function _reportedToVault(uint256 tokenId) internal returns (uint256) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (
+                logs[i].emitter == address(harness)
+                    && logs[i].topics[0] == V3Positions.V3LiquidityWithdrawn.selector
+                    && uint256(logs[i].topics[1]) == tokenId
+            ) {
+                (, address recipient, uint256 a0, uint256 a1) =
+                    abi.decode(logs[i].data, (uint128, address, uint256, uint256));
+                if (recipient == address(harness)) return address(hostile) < address(usdc) ? a0 : a1;
+            }
+        }
+        revert("no vault-recipient withdraw");
     }
 
     /// A swap that stops exactly on the position's lower / upper tick: the view must not

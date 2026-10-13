@@ -18,28 +18,43 @@ import {IUniswapV3Pool} from "../interfaces/IUniswapV3Pool.sol";
 /// @dev All flows are ERC-20 only. On Arc the position manager's WETH9 is a revert stub,
 /// so nothing here ever sends value or uses native-wrapping helpers.
 ///
-/// REQUIRED VAULT PATTERN for in-kind exits (reference: test/v3/V3PositionsHarness.sol).
+/// REQUIRED VAULT PATTERN for in-kind exits (reference: test/v3/V3PositionsHarness.sol,
+/// `inKindExit` / `sliceTo` / `claimOwed`; copy it, do not loop `withdrawSlice` directly).
 /// Positions hold arbitrary memecoins, any of which may revert on transfer (paused,
-/// blacklist, max-wallet...). One such token must never brick the exit for every
-/// other position, so the vault must NOT loop `withdrawSlice` directly. Instead:
-///  1. Loop every position. For each, call a vault-internal-only EXTERNAL entrypoint
-///     (callable solely by `address(this)`) via `try this.<selfCall>(tokenId, shares,
-///     supply, receiver)` that delegates to `withdrawSlice`. Because it is a separate
-///     call frame, a failed token transfer inside `collect` reverts the
-///     `decreaseLiquidity` with it, atomically.
-///  2. On failure, retry with `recipient = address(this)` and record an IOU
-///     `owed[receiver][token] += amount` for both position tokens, claimable later
-///     (e.g. once the receiver is un-blacklisted). The vault must exclude owed
-///     balances from its NAV and idle accounting.
-///  3. If that also fails (the token cannot move at all), skip the position and emit
-///     an event. Since the decrease reverted atomically nothing was removed: the
+/// blacklist, max-wallet...) or burn all gas it is given. One such token must never
+/// brick the exit for every other position. The vault must:
+///  1. Bind the self-call to the exit in progress: before the loop, write
+///     keccak256(abi.encode(shares, supply, receiver)) to a TRANSIENT slot (EIP-1153),
+///     clear it after; refuse to start an exit while it is set. The self-call entrypoint
+///     reverts unless `msg.sender == address(this)`, its (shares, supply, receiver)
+///     hash equals the stored value, and its recipient is that receiver or the vault.
+///  2. Loop every position, calling that entrypoint (which delegates to `withdrawSlice`)
+///     via `try this.<selfCall>{gas: SLICE_GAS}(...)`, with a fixed per-attempt gas cap
+///     (reference: 500k; a slice uses ~200k). Its own call frame makes a failed token
+///     transfer inside `collect` revert the `decreaseLiquidity` with it, atomically.
+///  3. EIP-150 guard: before EVERY attempt, revert if
+///     `gasleft() < SLICE_GAS * 64 / 63 + GAS_RESERVE` (reference reserve: 50k), so a
+///     caller who sends too little gas gets a revert, never silently skipped slices.
+///  4. If the first attempt fails having used >= ~90% of SLICE_GAS (measured with
+///     `gasleft()` around it), treat it as out-of-gas: skip the position (emit an event)
+///     without the fallback, so a gas burner costs one SLICE_GAS, not two.
+///  5. Otherwise retry with `recipient = address(this)` and record an IOU
+///     `owed[receiver][token] += amount` plus a per-token `owedTotal[token] += amount`,
+///     where `amount` is the vault's BALANCE DELTA of each token across the withdrawal
+///     (measured inside the gas-capped self-call), never the amounts returned by the
+///     position manager — fee-on-transfer tokens would otherwise over-credit. Claims
+///     decrement both. `owedTotal` belongs to exited holders: the vault must exclude it
+///     from `sweepSurplus` (AsyncBatchVault: balance - idle - pending - claimable must
+///     also subtract owedTotal) and from ANY balance-based valuation / NAV.
+///  6. If the fallback also fails (the token cannot move at all), skip the position and
+///     emit an event. Since the decrease reverted atomically nothing was removed: the
 ///     slice stays in the position and therefore accrues to the REMAINING holders,
 ///     while the exiting holder (whose shares are already burned) forfeits it. This
 ///     is the deliberate trade-off: a frozen token cannot be delivered or valued, so
 ///     the exit proceeds without it rather than being blocked indefinitely.
-/// A malicious token can also burn all gas forwarded to the self-call (63/64 of
-/// what remains); vaults should bound the gas forwarded per self-call so one
-/// position cannot starve the rest of the loop.
+/// Worst case per position is 2 x SLICE_GAS (a burner that evades the OOG heuristic by
+/// nesting deeper still only gets the fallback attempt), so MAX_POSITIONS v3 positions
+/// stay within Arc's 30M block gas limit.
 library V3Positions {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;

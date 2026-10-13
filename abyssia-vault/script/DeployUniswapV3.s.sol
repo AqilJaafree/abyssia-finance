@@ -7,7 +7,7 @@ import {console2} from "forge-std/console2.sol";
 /// @title DeployUniswapV3
 /// @notice Deploys Uniswap's OFFICIAL v3 build artifacts (npm v3-core 1.0.1 and
 /// v3-periphery 1.4.4: UniswapV3Factory, NonfungiblePositionManager; swap-router-contracts
-/// 1.3.1: SwapRouter02 — the router Uniswap deploys on Arc mainnet, so testnet matches it).
+/// 1.3.1, vendored in script/artifacts: SwapRouter02 — the router Uniswap deploys on Arc mainnet, so testnet matches it).
 /// Uniswap v3 is not deployed on Arc testnet, so Abyssia deploys its own copy there
 /// for testing. Mainnet always uses Uniswap's real deployment, never this script.
 /// @dev Usage (testnet only):
@@ -24,8 +24,9 @@ contract DeployUniswapV3 is Script {
         "node_modules/@uniswap/v3-core/artifacts/contracts/UniswapV3Factory.sol/UniswapV3Factory.json";
     string internal constant ART_NPM =
         "node_modules/@uniswap/v3-periphery/artifacts/contracts/NonfungiblePositionManager.sol/NonfungiblePositionManager.json";
-    string internal constant ART_ROUTER02 =
-        "node_modules/@uniswap/swap-router-contracts/artifacts/contracts/SwapRouter02.sol/SwapRouter02.json";
+    /// @dev Vendored from the deprecated npm swap-router-contracts 1.3.1 (bytecode only);
+    /// provenance and hash in script/artifacts/README.md.
+    string internal constant ART_ROUTER02 = "script/artifacts/SwapRouter02.json";
 
     /// @dev SwapRouter02 also routes Uniswap v2; there is no v2 here and Abyssia never
     /// uses v2 routes, so its v2 factory is left unset.
