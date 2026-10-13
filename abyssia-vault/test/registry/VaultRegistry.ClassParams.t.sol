@@ -76,7 +76,11 @@ contract VaultRegistryClassParamsTest is RegistryTestBase {
         _expectOutOfBounds(p);
 
         p = _memeParams();
-        p.maxWidthTicks = 887_273;
+        p.maxWidthTicks = 1_774_545;
+        _expectOutOfBounds(p);
+
+        p = _memeParams();
+        p.stopLossBps = 0;
         _expectOutOfBounds(p);
 
         p = _memeParams();

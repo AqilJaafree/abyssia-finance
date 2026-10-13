@@ -19,7 +19,7 @@ contract VaultRegistryPoolsTest is RegistryTestBase {
     // ---------------- v3 ----------------
 
     function test_addV3PoolResolvesThroughFactory() public {
-        v3Factory.setPool(address(usdc), address(meme), 3000, v3PoolAddr);
+        address v3PoolAddr = _deployV3Pool(3000);
         vm.prank(admin);
         bytes32 id = registry.addV3Pool(address(meme), 3000, MEME);
         assertEq(id, bytes32(uint256(uint160(v3PoolAddr))));
@@ -48,7 +48,7 @@ contract VaultRegistryPoolsTest is RegistryTestBase {
     }
 
     function test_addV3PoolTwiceReverts() public {
-        v3Factory.setPool(address(usdc), address(meme), 3000, v3PoolAddr);
+        _deployV3Pool(3000);
         vm.startPrank(admin);
         bytes32 id = registry.addV3Pool(address(meme), 3000, MEME);
         vm.expectRevert(abi.encodeWithSelector(VaultRegistry.PoolAlreadyAdded.selector, id));
@@ -57,7 +57,7 @@ contract VaultRegistryPoolsTest is RegistryTestBase {
     }
 
     function test_addPoolNeedsConfiguredClass() public {
-        v3Factory.setPool(address(usdc), address(meme), 3000, v3PoolAddr);
+        _deployV3Pool(3000);
         vm.prank(admin);
         vm.expectRevert(
             abi.encodeWithSelector(VaultRegistry.ClassNotConfigured.selector, VaultRegistry.AssetClass.Stable)

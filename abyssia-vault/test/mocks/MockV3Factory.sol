@@ -16,4 +16,12 @@ contract MockV3Factory is IUniswapV3Factory {
         (address t0, address t1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
         return pools[keccak256(abi.encode(t0, t1, fee))];
     }
+
+    function feeAmountTickSpacing(uint24 fee) external pure returns (int24) {
+        if (fee == 3000) return 60;
+        if (fee == 500) return 10;
+        if (fee == 10000) return 200;
+        if (fee == 100) return 1;
+        return 0;
+    }
 }

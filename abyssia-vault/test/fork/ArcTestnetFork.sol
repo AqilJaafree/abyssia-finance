@@ -7,6 +7,9 @@ import {Test} from "forge-std/Test.sol";
 /// ARC_TESTNET_RPC_URL is unset, so `forge test` stays offline-friendly.
 abstract contract ArcTestnetFork is Test {
     uint256 internal constant ARC_TESTNET_CHAIN_ID = 5042002;
+    /// @dev Pinned so fork results are reproducible: an Arc testnet block after the v4
+    /// deployment (~62,417,020).
+    uint256 internal constant FORK_BLOCK = 67_027_369;
 
     // Arc testnet (verified 2026-10-14): v4 lives at the same addresses as mainnet.
     address internal constant USDC = 0x3600000000000000000000000000000000000000;
@@ -24,7 +27,7 @@ abstract contract ArcTestnetFork is Test {
             vm.skip(true);
             return;
         }
-        vm.createSelectFork(url);
+        vm.createSelectFork(url, FORK_BLOCK);
         assertEq(block.chainid, ARC_TESTNET_CHAIN_ID, "not Arc testnet");
         forked = true;
     }

@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IUniswapV3Factory} from "../interfaces/IUniswapV3Factory.sol";
+import {IUniswapV3Pool} from "../interfaces/IUniswapV3Pool.sol";
 import {IStateView} from "../interfaces/IStateView.sol";
 import {PoolKey, PoolKeyLib} from "../types/PoolKey.sol";
 
@@ -14,6 +15,17 @@ import {PoolKey, PoolKeyLib} from "../types/PoolKey.sol";
 /// 2-of-3 Safe), so every loosening change is delayed. GUARDIAN_ROLE can only
 /// tighten, instantly. Allocation limits are enforced by the vault's rebalance
 /// logic (a later plan); this contract stores and validates them.
+///
+/// Deployment / operations requirements (trust assumptions):
+/// - The guardian MUST also be granted CANCELLER_ROLE on the TimelockController, so it can
+///   cancel a pending loosening during the 48h delay (tightening alone can't stop a scheduled
+///   setClassParams/enablePool/setHookAllowed from executing).
+/// - Classification (which AssetClass a pool is placed in) is a trust assumption on the
+///   timelocked admin: the registry cannot tell a memecoin from a bluechip, so a pool put
+///   in a looser class gets that class's looser limits.
+/// - DEFAULT_ADMIN_ROLE grants/renounces must be monitored: after 48h the timelock could grant
+///   admin to an EOA (removing the delay), and renouncing the last admin freezes the registry
+///   (no new pools, no re-enabling, no loosening ever again).
 contract VaultRegistry is AccessControl {
     using PoolKeyLib for PoolKey;
 
@@ -41,16 +53,17 @@ contract VaultRegistry is AccessControl {
     uint8 public constant HARD_MAX_RANGES = 10;
     uint16 public constant HARD_MAX_STOP_LOSS_BPS = 9_000;
     uint32 public constant HARD_MAX_COOLDOWN = 7 days;
-    int24 public constant MAX_WIDTH_TICKS = 887_272;
+    /// @notice Widest possible range: tickUpper - tickLower of a full-range position (2 * 887_272).
+    int24 public constant MAX_WIDTH_TICKS = 1_774_544;
 
     struct ClassParams {
         uint16 maxAllocationBps; // max share of the vault in one pool of this class
         uint16 maxClassBps; // max share of the vault across all pools of this class
         uint8 allowedShapes; // bitmask of SHAPE_*
         uint8 maxRanges; // max positions per pool
-        int24 minWidthTicks; // narrowest range allowed
-        int24 maxWidthTicks; // widest range allowed
-        uint16 stopLossBps; // forced-exit threshold (0 = none)
+        int24 minWidthTicks; // narrowest range allowed, as tickUpper - tickLower
+        int24 maxWidthTicks; // widest range allowed, as tickUpper - tickLower (<= MAX_WIDTH_TICKS = full range)
+        uint16 stopLossBps; // forced-exit threshold, 1..9000 bps (mandatory)
         uint32 rebalanceCooldown; // min seconds between rebalances of one pool
         uint128 minPoolLiquidity; // skip pools thinner than this
     }
@@ -61,6 +74,9 @@ contract VaultRegistry is AccessControl {
         bool enabled;
         address token; // the non-USDC side
         address v3Pool; // v3 only
+        uint24 fee; // both protocols (v4: the key's fee, may be the dynamic-fee flag)
+        int24 tickSpacing; // both protocols
+        bool usdcIsToken0; // both protocols: USDC is token0 / currency0
         PoolKey v4Key; // v4 only
     }
 
@@ -123,6 +139,9 @@ contract VaultRegistry is AccessControl {
     }
 
     /// @notice Guardian: lower a class's allocation limits instantly.
+    /// @dev A guardian-set 0 means "frozen, no new positions", never "unlimited". The guardian
+    /// may deliberately write states `_validate` would reject (e.g. 0/0); consumers must treat
+    /// them as frozen.
     function guardianReduceAllocation(AssetClass c, uint16 maxAllocationBps, uint16 maxClassBps)
         external
         onlyRole(GUARDIAN_ROLE)
@@ -136,6 +155,8 @@ contract VaultRegistry is AccessControl {
     }
 
     /// @notice Guardian: forbid shapes for a class instantly (disabling all = no new positions).
+    /// @dev allowedShapes == 0 means "frozen, no new positions", never "unlimited". The guardian
+    /// may deliberately write states `_validate` would reject.
     function guardianDisableShapes(AssetClass c, uint8 mask) external onlyRole(GUARDIAN_ROLE) {
         ClassParams storage p = _configured(c);
         p.allowedShapes &= ~mask;
@@ -152,8 +173,8 @@ contract VaultRegistry is AccessControl {
                 || p.maxAllocationBps > p.maxClassBps || p.maxClassBps > hardMaxClassBps(c)
                 || p.allowedShapes == 0 || (p.allowedShapes & ~ALL_SHAPES) != 0 || p.maxRanges == 0
                 || p.maxRanges > HARD_MAX_RANGES || p.minWidthTicks <= 0 || p.minWidthTicks > p.maxWidthTicks
-                || p.maxWidthTicks > MAX_WIDTH_TICKS || p.stopLossBps > HARD_MAX_STOP_LOSS_BPS
-                || p.rebalanceCooldown > HARD_MAX_COOLDOWN
+                || p.maxWidthTicks > MAX_WIDTH_TICKS || p.stopLossBps == 0
+                || p.stopLossBps > HARD_MAX_STOP_LOSS_BPS || p.rebalanceCooldown > HARD_MAX_COOLDOWN
         ) revert ParamOutOfBounds();
     }
 
@@ -179,13 +200,30 @@ contract VaultRegistry is AccessControl {
         (address t0, address t1) = token < usdc ? (token, usdc) : (usdc, token);
         address pool = v3Factory.getPool(t0, t1, fee);
         if (pool == address(0)) revert PoolNotFound();
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        if (sqrtPriceX96 == 0) revert PoolNotFound();
         poolId = bytes32(uint256(uint160(pool)));
         PoolKey memory emptyKey;
-        _addPool(poolId, PoolInfo(Protocol.V3, c, true, token, pool, emptyKey));
+        _addPool(
+            poolId,
+            PoolInfo({
+                protocol: Protocol.V3,
+                assetClass: c,
+                enabled: true,
+                token: token,
+                v3Pool: pool,
+                fee: fee,
+                tickSpacing: v3Factory.feeAmountTickSpacing(fee),
+                usdcIsToken0: t0 == usdc,
+                v4Key: emptyKey
+            })
+        );
     }
 
     /// @notice Allow a Uniswap v4 USDC/token pool. Native currency is rejected (Arc's
     /// 18-decimal USDC representation), and so are hooks that aren't explicitly allowed.
+    /// @dev fee and tickSpacing are not range-checked here: v4's PoolManager.initialize already
+    /// validates both, so a pool that is initialized (sqrtPrice != 0) has valid ones.
     function addV4Pool(PoolKey calldata key, AssetClass c)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -202,13 +240,33 @@ contract VaultRegistry is AccessControl {
         (uint160 sqrtPriceX96,,,) = v4StateView.getSlot0(poolId);
         if (sqrtPriceX96 == 0) revert PoolNotFound();
         address token = key.currency0 == usdc ? key.currency1 : key.currency0;
-        _addPool(poolId, PoolInfo(Protocol.V4, c, true, token, address(0), k));
+        _addPool(
+            poolId,
+            PoolInfo({
+                protocol: Protocol.V4,
+                assetClass: c,
+                enabled: true,
+                token: token,
+                v3Pool: address(0),
+                fee: key.fee,
+                tickSpacing: key.tickSpacing,
+                usdcIsToken0: key.currency0 == usdc,
+                v4Key: k
+            })
+        );
     }
 
     function setHookAllowed(address hook, bool allowed) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (hook == address(0)) revert ZeroAddress();
         hookAllowed[hook] = allowed;
         emit HookAllowed(hook, allowed);
+    }
+
+    /// @notice Guardian: revoke a hook instantly. Every v4 pool using it stops being usable
+    /// (see `isUsable`) and cannot be re-enabled until the admin re-allows the hook.
+    function guardianRevokeHook(address hook) external onlyRole(GUARDIAN_ROLE) {
+        hookAllowed[hook] = false;
+        emit HookAllowed(hook, false);
     }
 
     /// @notice Reclassify a pool (admin, timelocked: moving a pool to a looser class is a loosening).
@@ -229,7 +287,12 @@ contract VaultRegistry is AccessControl {
     }
 
     function enablePool(bytes32 poolId) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _known(poolId).enabled = true;
+        PoolInfo storage info = _known(poolId);
+        if (info.protocol == Protocol.V4) {
+            address hook = info.v4Key.hooks;
+            if (hook != address(0) && !hookAllowed[hook]) revert HookNotAllowed(hook);
+        }
+        info.enabled = true;
         emit PoolEnabled(poolId, true);
     }
 
@@ -245,8 +308,19 @@ contract VaultRegistry is AccessControl {
         return _known(poolId);
     }
 
+    /// @notice Raw enabled flag. Does NOT reflect hook revocation: rebalance must use `isUsable`.
     function isEnabled(bytes32 poolId) external view returns (bool) {
         return _pools[poolId].enabled;
+    }
+
+    /// @notice Whether new liquidity may go to this pool: known, enabled, and (v3, or v4 whose
+    /// hook is none or still allowed). The rebalance logic must use this, not `isEnabled`.
+    function isUsable(bytes32 poolId) external view returns (bool) {
+        PoolInfo storage info = _pools[poolId];
+        if (info.token == address(0) || !info.enabled) return false;
+        if (info.protocol == Protocol.V3) return true;
+        address hook = info.v4Key.hooks;
+        return hook == address(0) || hookAllowed[hook];
     }
 
     function _addPool(bytes32 poolId, PoolInfo memory info) private {

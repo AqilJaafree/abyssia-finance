@@ -10,6 +10,10 @@ interface IV3FactoryFull {
     function createPool(address tokenA, address tokenB, uint24 fee) external returns (address pool);
 }
 
+interface IV3PoolInit {
+    function initialize(uint160 sqrtPriceX96) external;
+}
+
 interface IPoolManagerInit {
     function initialize(PoolKey memory key, uint160 sqrtPriceX96) external returns (int24 tick);
 }
@@ -76,8 +80,20 @@ contract VaultRegistryArcTestnetTest is ArcTestnetFork {
 
     function test_addsV3PoolFromOfficialFactoryBytecode() public {
         address pool = IV3FactoryFull(v3Factory).createPool(USDC, address(meme), 3000);
+        IV3PoolInit(pool).initialize(SQRT_PRICE_1_1);
         vm.prank(admin);
         bytes32 id = registry.addV3Pool(address(meme), 3000, MEME);
-        assertEq(registry.getPool(id).v3Pool, pool);
+        VaultRegistry.PoolInfo memory info = registry.getPool(id);
+        assertEq(info.v3Pool, pool);
+        assertEq(info.fee, 3000);
+        assertEq(info.tickSpacing, 60);
+        assertEq(info.usdcIsToken0, USDC < address(meme));
+    }
+
+    function test_rejectsUninitializedV3Pool() public {
+        IV3FactoryFull(v3Factory).createPool(USDC, address(meme), 3000);
+        vm.prank(admin);
+        vm.expectRevert(VaultRegistry.PoolNotFound.selector);
+        registry.addV3Pool(address(meme), 3000, MEME);
     }
 }
