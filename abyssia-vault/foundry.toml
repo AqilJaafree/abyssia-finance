@@ -9,8 +9,12 @@ optimizer = true
 optimizer_runs = 200
 fuzz = { runs = 1000 }
 ignored_warnings_from = ["node_modules"]
-# Fork tests read Uniswap's official v3 build artifacts (v3 is not deployed on Arc testnet).
-fs_permissions = [{ access = "read", path = "./node_modules/@uniswap/v3-core/artifacts" }]
+# Tests and the testnet deploy script read Uniswap's official v3 build artifacts
+# (v3 is not deployed on Arc testnet).
+fs_permissions = [
+    { access = "read", path = "./node_modules/@uniswap/v3-core/artifacts" },
+    { access = "read", path = "./node_modules/@uniswap/v3-periphery/artifacts" },
+]
 
 [fmt]
 line_length = 110
