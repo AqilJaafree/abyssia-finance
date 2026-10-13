@@ -49,19 +49,20 @@ contract AsyncBatchVaultParamsTest is VaultTestBase {
     }
 
     function test_nonAdminCannotSetParams() public {
+        bytes32 role = vault.DEFAULT_ADMIN_ROLE();
         vm.startPrank(guardian);
-        vm.expectRevert();
+        _expectUnauthorized(guardian, role);
         vault.setMaxTotalAssets(1);
-        vm.expectRevert();
+        _expectUnauthorized(guardian, role);
         vault.setMinDeposit(1);
-        vm.expectRevert();
-        vault.unpause();
+        _expectUnauthorized(guardian, role);
+        vault.setMaxCycleMoveBps(1);
         vm.stopPrank();
     }
 
     function test_onlyGuardianCanPause() public {
+        _expectUnauthorized(alice, vault.GUARDIAN_ROLE());
         vm.prank(alice);
-        vm.expectRevert();
         vault.pause();
     }
 }

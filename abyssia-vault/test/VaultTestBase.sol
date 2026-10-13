@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {Test} from "forge-std/Test.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {AsyncBatchVaultHarness} from "./harness/AsyncBatchVaultHarness.sol";
@@ -35,6 +36,20 @@ abstract contract VaultTestBase is Test {
     function _gain(uint256 amount) internal {
         usdc.mint(address(vault), amount);
         vault.harnessIncreaseIdle(amount);
+    }
+
+    /// @dev Simulates a real -50% loss: all 100 USDC deployed, position now worth 50.
+    function _halveNav() internal {
+        vault.harnessDecreaseIdle(100 * USDC);
+        vault.setDeployedValue(50 * USDC);
+        deal(address(usdc), address(vault), 0);
+    }
+
+    /// @dev Expect the OZ AccessControl revert for `account` lacking `role`.
+    function _expectUnauthorized(address account, bytes32 role) internal {
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, account, role)
+        );
     }
 
     function _settle() internal {

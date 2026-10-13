@@ -79,18 +79,12 @@ contract AsyncBatchVaultHardeningTest is VaultTestBase {
 
     // --- F2: bounded guardian override -------------------------------------
 
-    /// @dev Simulates a real -50% loss: all 100 USDC deployed, position now worth 50.
-    function _halveNav() internal {
-        vault.harnessDecreaseIdle(100 * USDC);
-        vault.setDeployedValue(50 * USDC);
-        deal(address(usdc), address(vault), 0);
-    }
-
     function test_guardianOverrideWithinTolerance() public {
         _depositAndClaim(alice, 100 * USDC);
         _halveNav();
+        uint256 live = vault.sharePrice();
         vm.prank(keeper);
-        vm.expectRevert();
+        vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
         vault.settle();
 
         vm.prank(guardian);

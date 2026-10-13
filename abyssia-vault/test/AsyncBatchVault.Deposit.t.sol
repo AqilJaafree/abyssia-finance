@@ -130,8 +130,8 @@ contract AsyncBatchVaultDepositTest is VaultTestBase {
     }
 
     function test_onlyKeeperCanSettle() public {
+        _expectUnauthorized(alice, vault.KEEPER_ROLE());
         vm.prank(alice);
-        vm.expectRevert();
         vault.settle();
     }
 

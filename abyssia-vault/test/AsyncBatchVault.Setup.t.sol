@@ -52,6 +52,10 @@ contract AsyncBatchVaultSetupTest is VaultTestBase {
         vm.expectRevert(AsyncBatchVault.AsyncOnly.selector);
         vault.previewDeposit(1e6);
         vm.expectRevert(AsyncBatchVault.AsyncOnly.selector);
+        vault.previewMint(1e12);
+        vm.expectRevert(AsyncBatchVault.AsyncOnly.selector);
+        vault.previewWithdraw(1e6);
+        vm.expectRevert(AsyncBatchVault.AsyncOnly.selector);
         vault.previewRedeem(1e12);
     }
 
