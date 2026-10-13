@@ -17,13 +17,39 @@ import {IUniswapV3Pool} from "../interfaces/IUniswapV3Pool.sol";
 /// (keeping the vault under the 24 KB limit).
 /// @dev All flows are ERC-20 only. On Arc the position manager's WETH9 is a revert stub,
 /// so nothing here ever sends value or uses native-wrapping helpers.
+///
+/// REQUIRED VAULT PATTERN for in-kind exits (reference: test/v3/V3PositionsHarness.sol).
+/// Positions hold arbitrary memecoins, any of which may revert on transfer (paused,
+/// blacklist, max-wallet...). One such token must never brick the exit for every
+/// other position, so the vault must NOT loop `withdrawSlice` directly. Instead:
+///  1. Loop every position. For each, call a vault-internal-only EXTERNAL entrypoint
+///     (callable solely by `address(this)`) via `try this.<selfCall>(tokenId, shares,
+///     supply, receiver)` that delegates to `withdrawSlice`. Because it is a separate
+///     call frame, a failed token transfer inside `collect` reverts the
+///     `decreaseLiquidity` with it, atomically.
+///  2. On failure, retry with `recipient = address(this)` and record an IOU
+///     `owed[receiver][token] += amount` for both position tokens, claimable later
+///     (e.g. once the receiver is un-blacklisted). The vault must exclude owed
+///     balances from its NAV and idle accounting.
+///  3. If that also fails (the token cannot move at all), skip the position and emit
+///     an event. Since the decrease reverted atomically nothing was removed: the
+///     slice stays in the position and therefore accrues to the REMAINING holders,
+///     while the exiting holder (whose shares are already burned) forfeits it. This
+///     is the deliberate trade-off: a frozen token cannot be delivered or valued, so
+///     the exit proceeds without it rather than being blocked indefinitely.
+/// A malicious token can also burn all gas forwarded to the self-call (63/64 of
+/// what remains); vaults should bound the gas forwarded per self-call so one
+/// position cannot starve the rest of the loop.
 library V3Positions {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
     /// @dev Hard cap on open v3 positions per vault: keeps valuation and the
-    /// in-kind exit loop bounded in gas.
-    uint256 internal constant MAX_POSITIONS = 50;
+    /// in-kind exit loop bounded in gas. Measured ~178k gas per position for an
+    /// in-kind slice (~197k cold, incl. the try/self-call pattern: 25 positions
+    /// ≈ 4.9M, see test_inKindExitGasAtMaxPositions); 25 v3 + 25 v4 positions keep a
+    /// full in-kind exit well under Arc's 30M block gas limit.
+    uint256 internal constant MAX_POSITIONS = 25;
 
     struct State {
         uint256[] tokenIds;
@@ -53,6 +79,7 @@ library V3Positions {
     error TooManyPositions();
     error UnknownPosition(uint256 tokenId);
     error PositionNotEmpty(uint256 tokenId);
+    error InvalidSlice();
 
     /// @notice Mint a new range position owned by the caller (the vault).
     /// Approvals are exact and reset to zero afterwards.
@@ -133,26 +160,28 @@ library V3Positions {
         emit V3PositionClosed(tokenId);
     }
 
-    /// @notice In-kind exit: remove `shares / supply` of every position's liquidity and
-    /// send the released principal straight to `recipient`. No price is used, so
-    /// nothing can be manipulated against the remaining holders. Fees stay in the
-    /// positions (they belong to the vault and are harvested at settlement).
+    /// @notice In-kind exit slice of ONE position: remove floor(liquidity * shares / supply)
+    /// and send the released principal (no fees) straight to `recipient`, with zero
+    /// minimums. No price is used, so nothing can be manipulated against the
+    /// remaining holders. Fees stay in the position (they belong to the vault and are
+    /// harvested at settlement). Call it per position through a vault self-call — see
+    /// the REQUIRED VAULT PATTERN in the library NatSpec.
     /// @param supply total share supply BEFORE the exiting shares were burned.
-    function withdrawProRata(
+    function withdrawSlice(
         State storage s,
         INPM npm,
+        uint256 tokenId,
         uint256 shares,
         uint256 supply,
         address recipient,
         uint256 deadline
-    ) external {
-        uint256 n = s.tokenIds.length;
-        for (uint256 i = 0; i < n; i++) {
-            uint256 tokenId = s.tokenIds[i];
-            (,,,,,,, uint128 liquidity,,,,) = npm.positions(tokenId);
-            uint128 part = (uint256(liquidity) * shares / supply).toUint128();
-            if (part > 0) _withdraw(npm, tokenId, part, 0, 0, deadline, recipient);
-        }
+    ) external returns (uint256 amount0, uint256 amount1) {
+        _requireKnown(s, tokenId);
+        if (supply == 0 || shares > supply) revert InvalidSlice();
+        (,,,,,,, uint128 liquidity,,,,) = npm.positions(tokenId);
+        // shares <= supply, so the slice never exceeds the position's liquidity.
+        uint128 part = (uint256(liquidity) * shares / supply).toUint128();
+        return _withdraw(npm, tokenId, part, 0, 0, deadline, recipient);
     }
 
     function count(State storage s) external view returns (uint256) {
@@ -218,7 +247,10 @@ library V3Positions {
         // A tiny liquidity slice can release 0/0 (rounded down in the pool's favour);
         // the position manager's collect() reverts when both maxima are zero, which
         // would brick a small holder's in-kind exit — so skip it.
-        if (amount0 == 0 && amount1 == 0) return (0, 0);
+        if (amount0 == 0 && amount1 == 0) {
+            emit V3LiquidityWithdrawn(tokenId, liquidity, recipient, 0, 0);
+            return (0, 0);
+        }
         npm.collect(
             INPM.CollectParams({
                 tokenId: tokenId,

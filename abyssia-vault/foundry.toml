@@ -14,6 +14,7 @@ ignored_warnings_from = ["node_modules"]
 fs_permissions = [
     { access = "read", path = "./node_modules/@uniswap/v3-core/artifacts" },
     { access = "read", path = "./node_modules/@uniswap/v3-periphery/artifacts" },
+    { access = "read", path = "./node_modules/@uniswap/swap-router-contracts/artifacts" },
 ]
 
 [fmt]

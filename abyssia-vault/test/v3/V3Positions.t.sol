@@ -94,12 +94,12 @@ contract V3PositionsTest is V3TestBase {
         assertGt(_liquidity(tokenId), 0);
     }
 
-    function test_withdrawProRataTakesShareOfEveryPosition() public {
+    function test_inKindExitTakesShareOfEveryPosition() public {
         (uint256 idA, uint128 liqA) = _openInRange(1_000e6);
         _fundHarness(500e6, 0);
         (uint256 idB, uint128 liqB,,) = harness.open(_params(600, 1200, 500e6, 0));
 
-        harness.withdrawProRata(1, 4, receiver); // 25%
+        harness.inKindExit(1, 4, receiver); // 25%
 
         assertEq(_liquidity(idA), liqA - liqA / 4);
         assertEq(_liquidity(idB), liqB - liqB / 4);
@@ -107,20 +107,26 @@ contract V3PositionsTest is V3TestBase {
         assertGt(_bal(token1, receiver), 0);
     }
 
-    function test_withdrawProRataLeavesFeesInVault() public {
+    function test_inKindExitLeavesFeesInVault() public {
         (uint256 tokenId,) = _openInRange(1_000e6);
         _swap(token0, 100e6);
-        harness.withdrawProRata(1, 2, receiver);
+        harness.inKindExit(1, 2, receiver);
         (uint256 f0,) = harness.collectFees(tokenId, address(harness));
         assertApproxEqAbs(f0, 300_000, 2); // all fees still belong to the vault
     }
 
     /// @dev Regression: a slice so small it releases 0/0 must not revert the exit
-    /// (the position manager's collect() rejects two zero maxima).
-    function test_withdrawProRataTinySliceDoesNotRevert() public {
+    /// (the position manager's collect() rejects two zero maxima). The skip still emits.
+    function test_inKindExitTinySliceDoesNotRevert() public {
         (uint256 tokenId, uint128 liquidity) = _openInRange(1_000e6);
-        harness.withdrawProRata(600, 1e12, receiver);
-        assertEq(_liquidity(tokenId), liquidity - uint128(uint256(liquidity) * 600 / 1e12));
+        uint128 part = uint128(uint256(liquidity) * 600 / 1e12);
+        assertGt(part, 0); // the decrease really happens and rounds to 0/0
+        vm.expectEmit(true, false, false, true, address(harness));
+        emit V3Positions.V3LiquidityWithdrawn(tokenId, part, receiver, 0, 0);
+        harness.inKindExit(600, 1e12, receiver);
+        assertEq(_liquidity(tokenId), liquidity - part);
+        assertEq(_bal(token0, receiver), 0);
+        assertEq(_bal(token1, receiver), 0);
     }
 
     function test_withdrawRespectsMinimums() public {
@@ -161,6 +167,31 @@ contract V3PositionsTest is V3TestBase {
         harness.collectFees(idC, address(harness));
     }
 
+    function test_closeLastElementKeepsListConsistent() public {
+        (uint256 idA,) = _openInRange(100e6);
+        (uint256 idB,) = _openInRange(100e6);
+        (uint256 idC, uint128 liqC) = _openInRange(100e6);
+        harness.withdraw(idC, liqC, address(harness));
+        harness.close(idC); // last element: nothing to move
+        assertEq(harness.count(), 2);
+        assertEq(harness.tokenIdAt(0), idA);
+        assertEq(harness.tokenIdAt(1), idB);
+        vm.expectRevert(abi.encodeWithSelector(V3Positions.UnknownPosition.selector, idC));
+        harness.collectFees(idC, address(harness));
+
+        // Close down to the single remaining element, which is also the last.
+        harness.withdraw(idB, _liquidity(idB), address(harness));
+        harness.close(idB);
+        harness.withdraw(idA, _liquidity(idA), address(harness));
+        harness.close(idA);
+        assertEq(harness.count(), 0);
+
+        // The list is reusable afterwards.
+        (uint256 idD,) = _openInRange(100e6);
+        assertEq(harness.count(), 1);
+        assertEq(harness.tokenIdAt(0), idD);
+    }
+
     function test_unknownPositionReverts() public {
         vm.expectRevert(abi.encodeWithSelector(V3Positions.UnknownPosition.selector, 999));
         harness.withdraw(999, 1, receiver);
@@ -171,7 +202,8 @@ contract V3PositionsTest is V3TestBase {
     }
 
     function test_positionCapEnforced() public {
-        uint256 cap = 50;
+        uint256 cap = V3Positions.MAX_POSITIONS;
+        assertEq(cap, 25);
         _fundHarness(cap * 1e6, cap * 1e6);
         for (uint256 i = 0; i < cap; i++) {
             harness.open(_params(-600, 600, 1e6, 1e6));

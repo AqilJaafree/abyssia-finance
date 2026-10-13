@@ -18,6 +18,13 @@ interface IV3PoolDeploy {
     function initialize(uint160 sqrtPriceX96) external;
 }
 
+interface ISwapRouter02Wiring {
+    function factoryV2() external view returns (address);
+    function factory() external view returns (address);
+    function positionManager() external view returns (address);
+    function WETH9() external view returns (address);
+}
+
 /// @dev Rehearses the testnet v3 deployment on a fork of Arc testnet, then opens a
 /// position through it — the exact path a real testnet deployment will take.
 contract DeployUniswapV3ArcTestnetTest is ArcTestnetFork {
@@ -31,7 +38,12 @@ contract DeployUniswapV3ArcTestnetTest is ArcTestnetFork {
 
     function test_deploysWiredV3OnTestnet() public view {
         assertEq(INPM(d.positionManager).factory(), d.factory);
-        assertGt(d.swapRouter.code.length, 0);
+        ISwapRouter02Wiring router = ISwapRouter02Wiring(d.swapRouter02);
+        assertGt(d.swapRouter02.code.length, 0);
+        assertEq(router.factoryV2(), address(0));
+        assertEq(router.factory(), d.factory);
+        assertEq(router.positionManager(), d.positionManager);
+        assertEq(router.WETH9(), address(0));
     }
 
     function test_positionLifecycleOnTestnetDeployment() public {

@@ -18,13 +18,13 @@ interface IV3PoolTest {
     function initialize(uint160 sqrtPriceX96) external;
 }
 
-interface ISwapRouterTest {
+/// @dev SwapRouter02's exactInputSingle (no deadline field, unlike the v1 SwapRouter).
+interface ISwapRouter02Test {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -66,9 +66,25 @@ abstract contract V3TestBase is Test {
         _mint(token1, address(harness), amount1);
     }
 
+    /// @dev Every mock token here exposes the same `mint(address,uint256)`.
     function _mint(address token, address to, uint256 amount) internal {
-        if (token == address(usdc)) usdc.mint(to, amount);
-        else meme.mint(to, amount);
+        MockERC20(token).mint(to, amount);
+    }
+
+    /// @dev Create and initialize (at tick 0) a second USDC/`other` pool, fund the
+    /// harness and open a symmetric in-range position in it.
+    function _openUsdcPool(address other, uint256 amount)
+        internal
+        returns (uint256 tokenId, uint128 liquidity)
+    {
+        (address t0, address t1) = address(usdc) < other ? (address(usdc), other) : (other, address(usdc));
+        address p = IV3FactoryTest(v3.factory).createPool(t0, t1, FEE);
+        IV3PoolTest(p).initialize(TickMath.getSqrtPriceAtTick(0));
+        _mint(t0, address(harness), amount);
+        _mint(t1, address(harness), amount);
+        V3Positions.OpenParams memory params = _params(-600, 600, amount, amount);
+        (params.token0, params.token1) = (t0, t1);
+        (tokenId, liquidity,,) = harness.open(params);
     }
 
     function _params(int24 lower, int24 upper, uint256 a0, uint256 a1)
@@ -96,25 +112,29 @@ abstract contract V3TestBase is Test {
         (tokenId, liquidity,,) = harness.open(_params(-600, 600, amount, amount));
     }
 
-    /// @dev Swap through the official SwapRouter to generate fees.
+    /// @dev Swap through SwapRouter02 (the router on Arc mainnet) to generate fees.
     function _swap(address tokenIn, uint256 amountIn) internal {
-        address tokenOut = tokenIn == token0 ? token1 : token0;
+        _swapVia(v3.swapRouter02, tokenIn, tokenIn == token0 ? token1 : token0, amountIn, 0);
+    }
+
+    /// @dev Swap via `router` (a SwapRouter02), stopping at `sqrtPriceLimitX96` if non-zero.
+    function _swapVia(address router, address tokenIn, address tokenOut, uint256 amountIn, uint160 limit)
+        internal
+    {
         _mint(tokenIn, trader, amountIn);
         vm.startPrank(trader);
-        (bool ok,) =
-            tokenIn.call(abi.encodeWithSignature("approve(address,uint256)", v3.swapRouter, amountIn));
+        (bool ok,) = tokenIn.call(abi.encodeWithSignature("approve(address,uint256)", router, amountIn));
         require(ok, "approve");
-        ISwapRouterTest(v3.swapRouter)
+        ISwapRouter02Test(router)
             .exactInputSingle(
-                ISwapRouterTest.ExactInputSingleParams({
+                ISwapRouter02Test.ExactInputSingleParams({
                     tokenIn: tokenIn,
                     tokenOut: tokenOut,
                     fee: FEE,
                     recipient: trader,
-                    deadline: block.timestamp,
                     amountIn: amountIn,
                     amountOutMinimum: 0,
-                    sqrtPriceLimitX96: 0
+                    sqrtPriceLimitX96: limit
                 })
             );
         vm.stopPrank();
