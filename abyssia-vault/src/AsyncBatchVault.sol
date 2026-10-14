@@ -34,6 +34,11 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public constant MAX_SETTLE_TOLERANCE_BPS = 200; // 2%
     /// @dev Hard cap on the minimum time between keeper settlements.
     uint256 public constant MAX_MIN_SETTLE_INTERVAL = 1 hours;
+    /// @dev Fee hard caps: performance fee on gains above the high-water mark, and the
+    /// yearly management fee.
+    uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3_000; // 30%
+    uint256 public constant MAX_MANAGEMENT_FEE_BPS = 200; // 2% / year
+    uint256 internal constant YEAR = 365 days;
 
     struct Batch {
         uint128 depositAssets; // USDC requested for deposit in this batch
@@ -69,6 +74,16 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public minSettleInterval = 60;
     /// @notice Timestamp of the last settlement (0 before the first).
     uint256 public lastSettleTime;
+    /// @notice Receives fees, as newly minted shares, at each settlement.
+    address public treasury;
+    /// @notice Share of share-price gains above the high-water mark taken as a fee.
+    uint256 public performanceFeeBps = 1_500;
+    /// @notice Yearly management fee, accrued per second between settlements.
+    uint256 public managementFeeBps;
+    /// @notice Highest post-fee share price at any settlement (0 before the first).
+    uint256 public highWaterMark;
+    /// @notice When fees were last accrued (0 before the first settlement).
+    uint256 public lastFeeAccrual;
     /// @notice ERC-7540 operators: `operator` may cancel and claim on behalf of `controller`
     /// (and choose the receiver), so approving one is full trust over those requests.
     mapping(address controller => mapping(address operator => bool)) public isOperator;
@@ -93,6 +108,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     event MaxCycleMoveBpsSet(uint256 value);
     event SettleToleranceBpsSet(uint256 value);
     event MinSettleIntervalSet(uint256 value);
+    event FeesSet(uint256 performanceFeeBps, uint256 managementFeeBps);
+    event TreasurySet(address treasury);
+    event FeesAccrued(uint256 managementShares, uint256 performanceShares, uint256 highWaterMark);
     event SurplusSwept(address indexed to, uint256 surplus);
     event OperatorSet(address indexed controller, address indexed operator, bool approved);
 
@@ -136,6 +154,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(KEEPER_ROLE, keeper);
         _grantRole(GUARDIAN_ROLE, guardian);
+        treasury = admin;
         _setMinDeposit(minDeposit_);
         _setMaxCycleMoveBps(maxCycleMoveBps_);
         maxTotalAssets = maxTotalAssets_;
@@ -337,6 +356,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
                 if (move * BPS > last * maxCycleMoveBps) revert PriceMoveTooLarge(last, price);
             }
         }
+        // The guards check the pre-fee price; the batch converts at the post-fee price.
+        price = _accrueFees();
 
         // Both sides convert at the same pre-batch NAV / supply, i.e. one price.
         uint256 depositShares = _convertToShares(b.depositAssets, Math.Rounding.Floor);
@@ -497,6 +518,29 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         emit SettleToleranceBpsSet(value);
     }
 
+    /// @notice Admin (timelocked): set the fees within their hard caps. A management fee
+    /// change applies from the last accrual (the last settlement).
+    function setFees(uint256 performanceBps, uint256 managementBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (performanceBps > MAX_PERFORMANCE_FEE_BPS || managementBps > MAX_MANAGEMENT_FEE_BPS) {
+            revert ParamOutOfBounds();
+        }
+        (performanceFeeBps, managementFeeBps) = (performanceBps, managementBps);
+        emit FeesSet(performanceBps, managementBps);
+    }
+
+    /// @notice Guardian may only lower fees, instantly.
+    function lowerFees(uint256 performanceBps, uint256 managementBps) external onlyRole(GUARDIAN_ROLE) {
+        if (performanceBps > performanceFeeBps || managementBps > managementFeeBps) revert NotLower();
+        (performanceFeeBps, managementFeeBps) = (performanceBps, managementBps);
+        emit FeesSet(performanceBps, managementBps);
+    }
+
+    function setTreasury(address value) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (value == address(0) || value == address(this)) revert ZeroAddress();
+        treasury = value;
+        emit TreasurySet(value);
+    }
+
     function setMinSettleInterval(uint256 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (value > MAX_MIN_SETTLE_INTERVAL) revert ParamOutOfBounds();
         minSettleInterval = value;
@@ -558,6 +602,39 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     // ---------------------------------------------------------------------
     // Views / internals
     // ---------------------------------------------------------------------
+
+    /// @dev Mint fee shares to the treasury: the management fee for the time since the last
+    /// accrual (diluting by bps * dt / year), then the performance fee on the share-price gain
+    /// above the high-water mark. Returns the post-fee share price, which becomes the new
+    /// high-water mark if higher. The first settlement only sets the mark.
+    function _accrueFees() private returns (uint256 price) {
+        uint256 last = lastFeeAccrual;
+        lastFeeAccrual = block.timestamp;
+        uint256 supply = totalSupply();
+        uint256 mgmtShares;
+        uint256 perfShares;
+        if (supply != 0 && last != 0) {
+            uint256 rate = managementFeeBps * (block.timestamp - last); // bps * seconds
+            uint256 whole = BPS * YEAR;
+            if (rate != 0 && rate < whole) {
+                mgmtShares = supply.mulDiv(rate, whole - rate);
+                _mint(treasury, mgmtShares);
+            }
+            uint256 p = _sharePrice();
+            uint256 hwm = highWaterMark;
+            if (hwm != 0 && p > hwm && performanceFeeBps != 0) {
+                uint256 feeAssets =
+                    (p - hwm).mulDiv(totalSupply(), 10 ** decimals()) * performanceFeeBps / BPS;
+                // Shares worth `feeAssets` after they are minted: a / (A - a) of the supply.
+                perfShares =
+                    feeAssets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), totalAssets() + 1 - feeAssets);
+                _mint(treasury, perfShares);
+            }
+        }
+        price = _sharePrice();
+        if (price > highWaterMark) highWaterMark = price;
+        if (mgmtShares != 0 || perfShares != 0) emit FeesAccrued(mgmtShares, perfShares, highWaterMark);
+    }
 
     /// @notice Assets per 10**decimals() shares, at the current NAV.
     function sharePrice() external view returns (uint256) {

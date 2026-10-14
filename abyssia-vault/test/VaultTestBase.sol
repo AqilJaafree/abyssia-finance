@@ -21,6 +21,9 @@ abstract contract VaultTestBase is Test {
     function setUp() public virtual {
         usdc = new MockUSDC(6);
         vault = new AsyncBatchVaultHarness(usdc, admin, keeper, guardian);
+        // Core tests check share prices without fees; fees have their own test file.
+        vm.prank(admin);
+        vault.setFees(0, 0);
     }
 
     function _requestDeposit(address user, uint256 assets) internal {
