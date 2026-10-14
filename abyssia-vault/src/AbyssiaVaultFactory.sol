@@ -7,7 +7,9 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 /// @notice Deploys Abyssia vaults (CREATE2) from creation code the admin has approved by
 /// hash, and keeps the list of vaults it deployed, so integrators can tell an official
 /// vault from a look-alike. New vault versions are new approved hashes; existing vaults are
-/// never upgraded.
+/// never upgraded. The constructor arguments are not checked here, so DEPLOYER_ROLE must be
+/// held by the timelock (every deployment is then a delayed, cancellable proposal); the
+/// admin or guardian can delist a vault.
 /// @dev The vault's creation code (~26 KB with its libraries linked) is passed in the call
 /// rather than embedded here: embedding it would push this contract past the 24 KB limit.
 /// No seed deposit is made: a vault's NAV counts only idle USDC, positions and inventory it
@@ -16,6 +18,7 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 /// 6-decimal virtual offset).
 contract AbyssiaVaultFactory is AccessControl {
     bytes32 public constant DEPLOYER_ROLE = keccak256("DEPLOYER_ROLE");
+    bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
 
     mapping(bytes32 codeHash => bool) public approvedCode;
     mapping(address vault => bool) public isVault;
@@ -23,10 +26,13 @@ contract AbyssiaVaultFactory is AccessControl {
 
     event CodeApproved(bytes32 indexed codeHash, bool approved);
     event VaultDeployed(address indexed vault, bytes32 indexed codeHash, bytes32 salt);
+    event VaultDelisted(address indexed vault);
 
     error ZeroAddress();
     error CodeNotApproved(bytes32 codeHash);
     error DeployFailed();
+    error NotListed(address vault);
+    error Unauthorized();
 
     constructor(address admin, address deployer) {
         if (admin == address(0) || deployer == address(0)) revert ZeroAddress();
@@ -56,6 +62,17 @@ contract AbyssiaVaultFactory is AccessControl {
         isVault[vault] = true;
         _vaults.push(vault);
         emit VaultDeployed(vault, codeHash, salt);
+    }
+
+    /// @notice Admin or guardian: remove a vault from the official list (e.g. one deployed
+    /// with wrong constructor arguments). It stays in `vaultAt` history but `isVault` is false.
+    function delist(address vault) external {
+        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender) && !hasRole(GUARDIAN_ROLE, msg.sender)) {
+            revert Unauthorized();
+        }
+        if (!isVault[vault]) revert NotListed(vault);
+        isVault[vault] = false;
+        emit VaultDelisted(vault);
     }
 
     /// @notice The address `deploy` would return for these inputs.

@@ -97,4 +97,23 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         vault.setTreasury(address(vault));
         vm.stopPrank();
     }
+
+    /// Once a vault empties, the next holders' fee basis is the current price, not the old
+    /// peak.
+    function test_highWaterMarkResetsWhenTheVaultEmpties() public {
+        uint256 shares = _depositAndClaim(alice, 100 * USDC);
+        _gain(15 * USDC); // within the 20% cycle guard
+        _settle(); // peak ~1.1275
+        vm.prank(alice);
+        vault.redeemInKind(shares, alice);
+        uint256 rest = vault.balanceOf(treasury);
+        vm.prank(treasury);
+        vault.redeemInKind(rest, treasury);
+        assertEq(vault.totalSupply(), 0);
+        _depositAndClaim(bob, 100 * USDC); // settles on an empty vault
+        assertEq(vault.highWaterMark(), vault.lastSharePrice());
+        _gain(10 * USDC);
+        _settle();
+        assertGt(vault.balanceOf(treasury), 0); // the new gain is charged
+    }
 }

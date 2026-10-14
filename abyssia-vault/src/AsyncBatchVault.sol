@@ -306,7 +306,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
     /// @notice Settle the open batch at the current share price. Reverts unless the live
     /// price is within settleToleranceBps of `expectedPrice` (the keeper's off-chain fair
-    /// price: NAV from fair token prices, including fees about to be harvested), so a
+    /// price: NAV from fair token prices, including LP fees about to be harvested, and
+    /// BEFORE this settlement's performance/management fees are minted), so a
     /// sandwich that moves pool prices around this call makes it revert instead of settling
     /// at a manipulated NAV. Also reverts if the price moved more than maxCycleMoveBps since
     /// the last settlement (skipped on the first settlement and whenever the supply is zero).
@@ -632,7 +633,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
             }
         }
         price = _sharePrice();
-        if (price > highWaterMark) highWaterMark = price;
+        // An emptied vault starts over: the next holders' fee basis is today's price.
+        if (supply == 0 || price > highWaterMark) highWaterMark = price;
         if (mgmtShares != 0 || perfShares != 0) emit FeesAccrued(mgmtShares, perfShares, highWaterMark);
     }
 

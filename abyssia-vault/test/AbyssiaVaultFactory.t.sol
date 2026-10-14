@@ -78,4 +78,30 @@ contract AbyssiaVaultFactoryTest is Test {
         vm.expectRevert(AbyssiaVaultFactory.ZeroAddress.selector);
         new AbyssiaVaultFactory(address(0), deployer);
     }
+
+    /// A vault listed by mistake can be delisted by the admin or the guardian.
+    function test_delist() public {
+        address guardian = makeAddr("guardian");
+        bytes32 guardianRole = factory.GUARDIAN_ROLE();
+        vm.startPrank(admin);
+        factory.grantRole(guardianRole, guardian);
+        factory.setCodeApproved(keccak256(code), true);
+        vm.stopPrank();
+        vm.startPrank(deployer);
+        address a = factory.deploy(code, args, bytes32("a"));
+        address b = factory.deploy(code, args, bytes32("b"));
+        vm.expectRevert(AbyssiaVaultFactory.Unauthorized.selector);
+        factory.delist(a);
+        vm.stopPrank();
+        vm.prank(guardian);
+        factory.delist(a);
+        vm.prank(admin);
+        factory.delist(b);
+        assertFalse(factory.isVault(a));
+        assertFalse(factory.isVault(b));
+        assertEq(factory.vaultCount(), 2);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(AbyssiaVaultFactory.NotListed.selector, a));
+        factory.delist(a);
+    }
 }

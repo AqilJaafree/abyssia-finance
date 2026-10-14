@@ -25,7 +25,7 @@ The deployable vault: `AsyncBatchVault` plus Uniswap v3 and v4 positions in regi
 
 ### `src/AbyssiaVaultFactory.sol` — the factory
 
-Deploys vaults with CREATE2 from creation code whose hash the admin (the timelock) has approved, and lists every vault it deployed (`isVault`), so an official vault can be told from a look-alike. New versions are new approved hashes; vaults are never upgraded. There is no seed deposit: NAV only counts what the vault tracks internally, so donations can't inflate the share price.
+Deploys vaults with CREATE2 from creation code whose hash the admin (the timelock) has approved, and lists every vault it deployed (`isVault`), so an official vault can be told from a look-alike. New versions are new approved hashes; vaults are never upgraded. The factory doesn't check constructor arguments, so only the timelock holds the deployer role (every new vault is a delayed proposal the guardian can cancel), and the admin or guardian can `delist` a vault. There is no seed deposit: NAV only counts what the vault tracks internally, so donations can't inflate the share price.
 
 ### `src/AsyncBatchVault.sol` — vault core
 
@@ -143,7 +143,7 @@ forge script script/SepoliaTestPools.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcas
 forge script script/DeployAbyssia.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
 ```
 
-`DeployAbyssia` also supports Arc mainnet (addresses pinned per chain); it reverts on any other chain. Circle's Sepolia USDC faucet: https://faucet.circle.com.
+`DeployAbyssia` also supports Arc mainnet (addresses pinned per chain), where it requires a timelock delay of at least 48 hours and a proposer other than the deployer; it reverts on any other chain. It checks every setting's range, and fails the whole deployment unless the deployer ends up with no role anywhere. Circle's Sepolia USDC faucet: https://faucet.circle.com.
 
 ## Deploying Uniswap v3 to Arc testnet
 

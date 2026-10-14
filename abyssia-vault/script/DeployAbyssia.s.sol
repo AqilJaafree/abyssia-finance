@@ -13,6 +13,7 @@ import {IV4PositionManager} from "../src/interfaces/IV4PositionManager.sol";
 import {IStateView} from "../src/interfaces/IStateView.sol";
 import {ISwapRouter02} from "../src/interfaces/ISwapRouter02.sol";
 import {PoolKey} from "../src/types/PoolKey.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @title DeployAbyssia
 /// @notice Deploys one Abyssia memecoin vault and its governance:
@@ -65,12 +66,21 @@ contract DeployAbyssia is Script {
         AbyssiaVault vault;
     }
 
+    /// @dev Arc mainnet governance floor (the design's 48h timelock).
+    uint256 internal constant MAINNET_MIN_DELAY = 48 hours;
+
     error UnsupportedChain(uint256 chainId);
+    error UnsafeSettings(string reason);
+    error HandoverIncomplete(string what);
 
     function run() external returns (Deployed memory d) {
         uint256 pk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address deployer = vm.addr(pk);
         Settings memory s = settingsFromEnv();
+        if (block.chainid == ARC_MAINNET) {
+            if (s.timelockDelay < MAINNET_MIN_DELAY) revert UnsafeSettings("timelock delay below 48h");
+            if (s.proposer == deployer) revert UnsafeSettings("proposer must be the Safe, not the deployer");
+        }
         vm.startBroadcast(pk);
         d = deploy(network(block.chainid), s, deployer);
         vm.stopBroadcast();
@@ -119,15 +129,15 @@ contract DeployAbyssia is Script {
         s.maxCycleMoveBps = vm.envUint("VAULT_MAX_CYCLE_MOVE_BPS");
         s.maxSwapSlippageBps = vm.envUint("VAULT_MAX_SWAP_SLIPPAGE_BPS");
         s.memecoin = VaultRegistry.ClassParams({
-            maxAllocationBps: uint16(vm.envUint("MEMECOIN_MAX_ALLOCATION_BPS")),
-            maxClassBps: uint16(vm.envUint("MEMECOIN_MAX_CLASS_BPS")),
-            allowedShapes: uint8(vm.envUint("MEMECOIN_ALLOWED_SHAPES")),
-            maxRanges: uint8(vm.envUint("MEMECOIN_MAX_RANGES")),
-            minWidthTicks: int24(vm.envInt("MEMECOIN_MIN_WIDTH_TICKS")),
-            maxWidthTicks: int24(vm.envInt("MEMECOIN_MAX_WIDTH_TICKS")),
-            stopLossBps: uint16(vm.envUint("MEMECOIN_STOP_LOSS_BPS")),
-            rebalanceCooldown: uint32(vm.envUint("MEMECOIN_REBALANCE_COOLDOWN")),
-            minPoolLiquidity: uint128(vm.envUint("MEMECOIN_MIN_POOL_LIQUIDITY"))
+            maxAllocationBps: SafeCast.toUint16(vm.envUint("MEMECOIN_MAX_ALLOCATION_BPS")),
+            maxClassBps: SafeCast.toUint16(vm.envUint("MEMECOIN_MAX_CLASS_BPS")),
+            allowedShapes: SafeCast.toUint8(vm.envUint("MEMECOIN_ALLOWED_SHAPES")),
+            maxRanges: SafeCast.toUint8(vm.envUint("MEMECOIN_MAX_RANGES")),
+            minWidthTicks: SafeCast.toInt24(vm.envInt("MEMECOIN_MIN_WIDTH_TICKS")),
+            maxWidthTicks: SafeCast.toInt24(vm.envInt("MEMECOIN_MAX_WIDTH_TICKS")),
+            stopLossBps: SafeCast.toUint16(vm.envUint("MEMECOIN_STOP_LOSS_BPS")),
+            rebalanceCooldown: SafeCast.toUint32(vm.envUint("MEMECOIN_REBALANCE_COOLDOWN")),
+            minPoolLiquidity: SafeCast.toUint128(vm.envUint("MEMECOIN_MIN_POOL_LIQUIDITY"))
         });
         s.allowToken = vm.envOr("ALLOW_TOKEN", address(0));
         s.salt = vm.envOr("VAULT_SALT", bytes32(0));
@@ -157,6 +167,7 @@ contract DeployAbyssia is Script {
 
         // 3-4. Factory approving this build's vault code, and the vault through it.
         d.factory = new AbyssiaVaultFactory(actor, actor);
+        d.factory.grantRole(d.factory.GUARDIAN_ROLE(), s.guardian);
         bytes memory code = type(AbyssiaVault).creationCode;
         d.factory.setCodeApproved(keccak256(code), true);
         d.vault = AbyssiaVault(d.factory.deploy(code, abi.encode(_config(n, s, d.registry, actor)), s.salt));
@@ -168,11 +179,30 @@ contract DeployAbyssia is Script {
         d.registry.renounceRole(admin, actor);
         d.vault.grantRole(admin, address(d.timelock));
         d.vault.renounceRole(admin, actor);
-        d.factory.grantRole(d.factory.DEPLOYER_ROLE(), s.proposer);
+        // Constructor args are not checked by the factory, so only the timelock may deploy:
+        // every new vault is a delayed proposal the guardian can cancel.
+        d.factory.grantRole(d.factory.DEPLOYER_ROLE(), address(d.timelock));
         d.factory.renounceRole(d.factory.DEPLOYER_ROLE(), actor);
         d.factory.grantRole(admin, address(d.timelock));
         d.factory.renounceRole(admin, actor);
         d.timelock.renounceRole(admin, actor);
+        _assertHandover(d, actor);
+    }
+
+    /// @dev Fail the whole deployment unless the deployer kept no role anywhere.
+    function _assertHandover(Deployed memory d, address actor) internal view {
+        bytes32 admin = 0x00;
+        if (d.registry.hasRole(admin, actor) || !d.registry.hasRole(admin, address(d.timelock))) {
+            revert HandoverIncomplete("registry");
+        }
+        if (d.vault.hasRole(admin, actor) || !d.vault.hasRole(admin, address(d.timelock))) {
+            revert HandoverIncomplete("vault");
+        }
+        if (
+            d.factory.hasRole(admin, actor) || d.factory.hasRole(d.factory.DEPLOYER_ROLE(), actor)
+                || !d.factory.hasRole(admin, address(d.timelock))
+        ) revert HandoverIncomplete("factory");
+        if (d.timelock.hasRole(admin, actor)) revert HandoverIncomplete("timelock");
     }
 
     function _config(Network memory n, Settings memory s, VaultRegistry registry, address actor)
