@@ -137,13 +137,28 @@ Uniswap v3 and v4 and Circle's USDC are deployed on Sepolia, so the vault runs a
 ```sh
 # 1. Test memecoin (TMEME) with USDC pools on v3 and v4, seeded with SEED_USDC each,
 #    and the v3 pool's observation capacity raised for the vault's TWAP floor.
-forge script script/SepoliaTestPools.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
+forge script script/SepoliaTestPools.s.sol --tc SepoliaTestPools \
+  --rpc-url $SEPOLIA_RPC_URL --broadcast --slow --skip-simulation
 # 2. Wait ~10 minutes for the v3 TWAP window to fill, set ALLOW_TOKEN to the TMEME address,
 #    then deploy the timelock, registry, factory and vault (admin handed to the timelock).
-forge script script/DeployAbyssia.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
+forge script script/DeployAbyssia.s.sol --tc DeployAbyssia \
+  --rpc-url $SEPOLIA_RPC_URL --broadcast --slow --skip-simulation
 ```
 
+`--skip-simulation` makes forge take each gas limit from the node. Sepolia runs Glamsterdam, which prices new storage (~111k gas a slot) and code deposit (~1,540 gas a byte) well above forge's local EVM, so locally simulated gas limits run out on-chain. The vault's deployment needs ~37M gas; Sepolia accepts it.
+
 `DeployAbyssia` also supports Arc mainnet (addresses pinned per chain), where it requires a timelock delay of at least 48 hours and a proposer other than the deployer; it reverts on any other chain. It checks every setting's range, and fails the whole deployment unless the deployer ends up with no role anywhere. Circle's Sepolia USDC faucet: https://faucet.circle.com.
+
+### Live on Sepolia (2026-10-14, test settings)
+
+| Contract | Address |
+|---|---|
+| TimelockController (5-minute delay) | `0x6dd5Cd6C23b41eeF17bB53cac670a5C36e9EA010` |
+| VaultRegistry | `0x40094e2feb102D14d8cee4480633d49FB2f092C5` |
+| AbyssiaVaultFactory | `0xdCdA4667eb247B7afd6d9bf47cB3aC2d0869D909` |
+| AbyssiaVault (abMEME) | `0xC5C648C2CF3D6e3fD94Df24126D2a4f6c430351b` |
+| TMEME test token | `0xae3356967807B0ff56E612020695e2B054582c99` |
+| TMEME/USDC 0.3% v3 pool | `0x47B8b6Ff9b32e51AE37e87Fad4E6489eB1B3e67D` |
 
 ## Deploying Uniswap v3 to Arc testnet
 

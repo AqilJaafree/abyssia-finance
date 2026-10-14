@@ -47,7 +47,9 @@ interface IPoolManagerInit {
 /// DeployAbyssia with ALLOW_TOKEN set to the printed token address.
 /// @dev Usage:
 ///   DEPLOYER_PRIVATE_KEY=0x... SEED_USDC=2000000 forge script script/SepoliaTestPools.s.sol \
-///     --rpc-url $SEPOLIA_RPC_URL --broadcast
+///     --tc SepoliaTestPools --rpc-url $SEPOLIA_RPC_URL --broadcast --slow --skip-simulation
+/// `--skip-simulation` makes forge take gas limits from the node: forge's local EVM
+/// prices storage and code deposit below Sepolia's Glamsterdam schedule.
 contract SepoliaTestPools is Script {
     uint256 internal constant SEPOLIA = 11_155_111;
     address internal constant USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
@@ -62,9 +64,9 @@ contract SepoliaTestPools is Script {
     /// @dev 1 TMEME (1e18) = 0.01 USDC (1e4): raw price 1e14 (or 1e-14), ~ tick 322,378.
     int24 internal constant PRICE_TICK = 322_380;
     /// @dev Observation capacity for the v3 pool, raised in chunks: Sepolia caps a
-    /// transaction at 2^24 gas and each new slot costs ~22k.
+    /// transaction at 2^24 gas and, since Glamsterdam, each new slot costs ~111k.
     uint16 internal constant OBSERVATIONS = 1_200;
-    uint16 internal constant OBSERVATION_CHUNK = 300;
+    uint16 internal constant OBSERVATION_CHUNK = 100;
     uint8 internal constant MINT_POSITION = 0x02;
     uint8 internal constant SETTLE_PAIR = 0x0d;
 
@@ -104,7 +106,8 @@ contract SepoliaTestPools is Script {
         }
         IERC20(t0).approve(NPM, a0);
         IERC20(t1).approve(NPM, a1);
-        INPM(NPM).mint(INPM.MintParams(t0, t1, FEE, -FULL, FULL, a0, a1, 0, 0, actor, block.timestamp));
+        INPM(NPM)
+            .mint(INPM.MintParams(t0, t1, FEE, -FULL, FULL, a0, a1, 0, 0, actor, block.timestamp + 1 hours));
 
         // v4: initialize a hookless pool, seed full range through Permit2.
         p.v4Key = PoolKey(t0, t1, FEE, SPACING, address(0));
