@@ -23,7 +23,9 @@ The deployable vault: `AsyncBatchVault` plus Uniswap v3 and v4 positions in regi
 - **Recovery.** `sweepSurplus` (USDC) and `sweepTokenSurplus` (other tokens) send out only what the vault holds beyond its books and IOUs.
 - Code lives mostly in external libraries to stay under the 24 KB contract limit: `src/libraries/VaultBook.sol` (position/inventory book, valuation, exposure checks), `src/libraries/VaultOps.sol` (position, swap and inventory operations), `src/libraries/VaultRebalance.sol` (rebalance and stop-loss), `src/libraries/Shapes.sol` (shape → ranges), `src/libraries/PoolOracle.sol` (v3 TWAP), `src/libraries/VaultSwaps.sol` (v3 swaps through SwapRouter02, v4 swaps through the PoolManager), `src/libraries/PoolPrice.sol` (USDC ⇄ token at a sqrt price).
 
-Not yet built: performance/management fees, the factory and deployment.
+### `src/AbyssiaVaultFactory.sol` — the factory
+
+Deploys vaults with CREATE2 from creation code whose hash the admin (the timelock) has approved, and lists every vault it deployed (`isVault`), so an official vault can be told from a look-alike. New versions are new approved hashes; vaults are never upgraded. There is no seed deposit: NAV only counts what the vault tracks internally, so donations can't inflate the share price.
 
 ### `src/AsyncBatchVault.sol` — vault core
 
@@ -34,6 +36,7 @@ Abstract ERC-4626 share token over 6-decimal USDC with ERC-7540-style batched se
 - **Instant in-kind exit.** `redeemInKind` burns shares for a pro-rata slice of idle USDC plus every position, with no price involved, so nothing can be manipulated against remaining holders. Always available, even while paused.
 - **Donation-proof accounting.** Idle USDC is tracked internally (`idleAssets`), never read from `balanceOf`, so donations cannot move the share price. `sweepSurplus` sends out anything beyond the vault's accounting.
 - **Limits and roles.** Minimum deposit, total-assets cap and price-move limit (the minimum deposit and price-move limit are bounded by hard caps in code). `DEFAULT_ADMIN_ROLE` (intended: a timelock owned by a multisig) loosens; `GUARDIAN_ROLE` can only tighten (pause, lower the cap) and acts instantly; `KEEPER_ROLE` settles.
+- **Fees.** At each settlement the treasury is minted shares: a performance fee (default 15%, hard cap 30%) on share-price gains above the high-water mark, and a management fee (default 0%, hard cap 2%/yr) accrued per second. The admin sets them through the timelock; the guardian can only lower them. The settle price guards check the pre-fee price; the batch converts at the post-fee price.
 - **Operators (ERC-7540).** `setOperator` / `isOperator`; operators can `cancelDepositRequestFor`, `cancelRedeemRequestFor`, `claimDepositFor`, `claimRedeemFor`.
 - LP-position logic plugs in through internal hooks (`_deployedValue`, `_ensureIdle`, `_redeemPositionsInKind`, `_beforeSettle`, `_reservedAssets`).
 
@@ -104,6 +107,7 @@ forge test --gas-report                            # gas usage per function
 | `test/v4/` | v4 adapter against Uniswap's official v4 bytecode deployed locally (PoolManager, PositionManager, StateView, Permit2), fee harvesting, in-kind exits with hostile tokens, fuzzing |
 | `test/libraries/` | `Shapes`: range placement and weights, with a layout-invariant fuzz test |
 | `test/vault/` | `AbyssiaVault` on local v3 + v4: rebalancing into shapes, cooldown, tick band and v3 TWAP guards, stop-loss, keeper operations and every registry check, swaps, settlement with fee harvesting, in-kind exits with hostile tokens and IOUs, worst-case exit gas at the position cap, operators, a smart account using every path, and a fuzz test that the books always match real balances |
+| `test/AsyncBatchVault.Fees.t.sol`, `test/AbyssiaVaultFactory.t.sol` | Fee math (high-water mark, per-second management fee, caps) and the factory's code-hash allowlist |
 | `test/script/` | Pins the vendored SwapRouter02 bytecode hash |
 | `test/fork/` | Fork tests against Arc testnet and mainnet |
 | `test/mocks/`, `test/harness/` | Mock tokens/pools and test harnesses |
@@ -119,11 +123,27 @@ forge test --match-path "test/fork/*" -vv
 
 - `ARC_TESTNET_RPC_URL`: the registry, the v4 adapter and the vault end to end against the real Uniswap v4 deployment, and a rehearsal of the v3 deploy script.
 - `ARC_MAINNET_RPC_URL`: the v3 adapter against Uniswap's real v3 position manager and router.
+- `SEPOLIA_RPC_URL`: both deployment scripts end to end on Ethereum Sepolia (real Uniswap v3/v4 and USDC), the timelock handover and delay, and a full vault lifecycle.
 
 Notes:
 
 - With `.env` present, a plain `forge test` also hits the network. The public testnet RPC is rate-limited; fork tests pin a block to keep results reproducible.
 - Arc's USDC can't be transferred inside a Foundry fork (it relies on an Arc precompile), so fork tests use a 6-decimal mock USDC.
+
+## Deploying to Ethereum Sepolia
+
+Uniswap v3 and v4 and Circle's USDC are deployed on Sepolia, so the vault runs against the real contracts there. Copy `.env.example` to `.env`, fill in the deployment section (every value is required), and pass the deployer key through the environment, never a committed file.
+
+```sh
+# 1. Test memecoin (TMEME) with USDC pools on v3 and v4, seeded with SEED_USDC each,
+#    and the v3 pool's observation capacity raised for the vault's TWAP floor.
+forge script script/SepoliaTestPools.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
+# 2. Wait ~10 minutes for the v3 TWAP window to fill, set ALLOW_TOKEN to the TMEME address,
+#    then deploy the timelock, registry, factory and vault (admin handed to the timelock).
+forge script script/DeployAbyssia.s.sol --rpc-url $SEPOLIA_RPC_URL --broadcast
+```
+
+`DeployAbyssia` also supports Arc mainnet (addresses pinned per chain); it reverts on any other chain. Circle's Sepolia USDC faucet: https://faucet.circle.com.
 
 ## Deploying Uniswap v3 to Arc testnet
 
