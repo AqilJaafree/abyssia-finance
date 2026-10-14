@@ -113,7 +113,7 @@ contract DeployAbyssia is Script {
                 swapRouter02: 0x53BF6B0684Ec7eF91e1387Da3D1a1769bC5A6F77,
                 posm: 0x6049c9a0e26405C0985f9E3685C87d0aE917f82B,
                 stateView: 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b,
-                blockTimeMs: 500 // measured: 10,000 blocks in ~5,070 s
+                blockTimeMs: 400 // measured ~507 ms (10,000 blocks in ~5,070 s); rounded down for margin
             });
         }
         revert UnsupportedChain(chainId);

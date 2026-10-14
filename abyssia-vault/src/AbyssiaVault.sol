@@ -90,7 +90,7 @@ contract AbyssiaVault is AsyncBatchVault {
         ISwapRouter02 swapRouter02;
         IV4PositionManager posm;
         IStateView stateView;
-        uint256 blockTimeMs; // the chain's (shortest) block time, for the observation floor
+        uint256 blockTimeMs; // the chain's block time, rounded down for margin (observation floor)
     }
 
     VaultRegistry public immutable registry;
@@ -113,7 +113,7 @@ contract AbyssiaVault is AsyncBatchVault {
     /// @notice Minimum observation capacity a v3 pool must keep for its TWAP to count (see
     /// PoolOracle.checkedTwapTick): about twapWindow / block time, with margin. Raise a
     /// pool's capacity once with `increaseObservationCardinalityNext` before using it.
-    uint16 public minObservations = 1_200;
+    uint16 public minObservations = 1_500;
 
     event SliceSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event HarvestSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
@@ -251,15 +251,19 @@ contract AbyssiaVault is AsyncBatchVault {
 
     /// @notice Keeper or guardian: post a hookless v4 pool's reference tick, which its price
     /// must stay within maxTwapDeviation of for keeper rebalances and swaps, and which values
-    /// the stop-loss (a v3 pool's TWAP plays this role). Only the guardian can post the
-    /// first one; after that each post may move it at most maxTwapDeviation ticks, at most
-    /// once per twapWindow.
+    /// the stop-loss (a v3 pool's TWAP plays this role). The guardian (re-)anchors it at any
+    /// time, within maxRebalanceTickDeviation of the pool's current tick, e.g. after a crash.
+    /// The keeper, not while paused, moves it at most maxTwapDeviation ticks, at most once per
+    /// twapWindow after the last post by anyone, so it can't undo a guardian correction.
     function postReferenceTick(bytes32 poolId, int24 tick) external {
         bool guardian = hasRole(GUARDIAN_ROLE, msg.sender);
-        if (!guardian && !hasRole(KEEPER_ROLE, msg.sender)) {
-            revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
+        if (!guardian) {
+            _checkRole(KEEPER_ROLE);
+            _requireNotPaused();
         }
-        VaultBook.postReferenceTick(_book, registry, poolId, tick, guardian, twapWindow, maxTwapDeviation);
+        VaultBook.postReferenceTick(
+            _book, _env(), poolId, tick, guardian, twapWindow, maxTwapDeviation, maxRebalanceTickDeviation
+        );
     }
 
     /// @notice Keeper or guardian: pull all liquidity out of `poolId` into the vault (no

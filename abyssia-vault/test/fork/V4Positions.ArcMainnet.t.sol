@@ -60,7 +60,7 @@ contract V4PositionsArcMainnetTest is ArcMainnetFork {
         assertEq(posm.permit2(), PERMIT2);
         assertEq(IStateViewManager(n.stateView).poolManager(), V4_POOL_MANAGER);
         assertGt(PERMIT2.code.length, 0);
-        assertEq(n.blockTimeMs, 500);
+        assertEq(n.blockTimeMs, 400);
     }
 
     /// Open, earn fees, in-kind exit, harvest, withdraw and close on the real contracts;

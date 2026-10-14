@@ -312,7 +312,7 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         vault.setPriceGuards(100, 601, 500);
         vm.stopPrank();
         AbyssiaVault.Config memory c = _config();
-        c.blockTimeMs = 499; // the default 1,200 observations would not cover 600 s
+        c.blockTimeMs = 399; // the default 1,500 observations would not cover 600 s
         vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
         new AbyssiaVault(c);
     }

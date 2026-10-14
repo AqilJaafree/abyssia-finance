@@ -58,7 +58,7 @@ contract SepoliaTestPools is Script {
     int24 internal constant PRICE_TICK = 322_380;
     /// @dev Observation capacity for the v3 pool, raised in chunks: Sepolia caps a
     /// transaction at 2^24 gas and, since Glamsterdam, each new slot costs ~111k.
-    uint16 internal constant OBSERVATIONS = 1_200;
+    uint16 internal constant OBSERVATIONS = 1_500;
     uint16 internal constant OBSERVATION_CHUNK = 100;
     uint8 internal constant MINT_POSITION = 0x02;
     uint8 internal constant SETTLE_PAIR = 0x0d;

@@ -34,21 +34,75 @@ contract AbyssiaVaultReferenceTest is AbyssiaVaultTestBase {
         assertEq(r.updatedAt, block.timestamp);
 
         uint256 next = block.timestamp + vault.twapWindow();
-        vm.prank(guardian);
+        vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(VaultBook.ReferenceTooSoon.selector, next));
         vault.postReferenceTick(v4PoolId, 400);
-        vm.warp(block.timestamp + vault.twapWindow());
+        vm.warp(next);
         vm.prank(keeper);
         vm.expectRevert(
             abi.encodeWithSelector(VaultBook.ReferenceStepTooLarge.selector, int24(500), int24(-1))
         );
         vault.postReferenceTick(v4PoolId, -1);
+
+        // The guardian re-anchors at any time, but only near the pool's spot (tick 0).
+        vm.prank(guardian);
+        vm.expectRevert(abi.encodeWithSelector(VaultBook.InvalidReference.selector, v4PoolId, int24(101)));
+        vault.postReferenceTick(v4PoolId, 101);
         vm.prank(guardian);
         vault.postReferenceTick(v4PoolId, 0);
+        // ...and the keeper's cooldown restarts, so it can't undo the correction at once.
+        vm.prank(keeper);
+        vm.expectPartialRevert(VaultBook.ReferenceTooSoon.selector);
+        vault.postReferenceTick(v4PoolId, 100);
 
         _expectUnauthorized(alice, vault.KEEPER_ROLE());
         vm.prank(alice);
         vault.postReferenceTick(v4PoolId, 0);
+    }
+
+    /// Review M-1: after a crash the guardian re-anchors the reference in one post, so the
+    /// keeper can sell inventory at once instead of walking 500 ticks per window.
+    function test_guardianReanchorsAfterACrash() public {
+        uint256 got = _keeperSwap(v4PoolId, true, 1_000e6);
+        _traderSwapV4(address(meme), 400_000e6); // the token crashes
+        uint256 minOut = _floor(v4PoolId, false, got);
+        vm.prank(keeper);
+        vm.expectPartialRevert(VaultBook.PriceOffReference.selector);
+        vault.swap(v4PoolId, false, got, minOut);
+        int24 spot = _tick(v4PoolId);
+        assertGt(spot > 0 ? spot : -spot, 2_000); // thousands of ticks away (direction depends on token order)
+        vm.prank(guardian);
+        vault.postReferenceTick(v4PoolId, spot);
+        vm.prank(keeper);
+        vault.swap(v4PoolId, false, got, minOut);
+        assertEq(vault.tokenBalance(address(meme)), 0);
+    }
+
+    /// Review L-1: the keeper can't move the reference while paused.
+    function test_keeperCantPostWhilePaused() public {
+        vm.prank(guardian);
+        vault.pause();
+        vm.warp(block.timestamp + vault.twapWindow());
+        vm.prank(keeper);
+        vm.expectRevert(); // EnforcedPause
+        vault.postReferenceTick(v4PoolId, 100);
+        vm.prank(guardian);
+        vault.postReferenceTick(v4PoolId, 50);
+    }
+
+    /// Review L-2: the stop-loss basis is the reference price, so a rebalance with spot
+    /// away from the reference is not an instant "loss".
+    function test_entryIsTheReferencePrice() public {
+        _traderSwapV4(address(usdc), 4_000e6); // spot drifts, within the band
+        int24 spot = _tick(v4PoolId);
+        assertGt(spot > 0 ? spot : -spot, 50);
+        uint256 got = _keeperSwap(v4PoolId, true, 1_000e6);
+        _rebalance(v4PoolId, _spec(Shapes.SPOT, Shapes.TOKEN_ONLY, 3, 600), 0, got);
+        (uint160 entry,,) = vault.poolState(v4PoolId);
+        assertEq(entry, TickMath.getSqrtPriceAtTick(0)); // the reference, not the spot
+        vm.prank(keeper);
+        vm.expectRevert(); // StopLossNotReached: same price on both sides, no loss at all
+        vault.stopLoss(v4PoolId);
     }
 
     /// Only the guardian can post a pool's first reference; v3 pools (TWAP) and ticks out of

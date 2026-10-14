@@ -71,6 +71,7 @@ library VaultRebalance {
             revert CooldownActive(last + x.params.rebalanceCooldown);
         }
         int24 tick = _checkPrice(b, e, m, a, l);
+        _recordEntry(b, a, l);
 
         usdcIn = _unwind(b, e, a.poolId);
         if (a.tokenAmount == type(uint256).max) a.tokenAmount = b.tokenBalance[m.token];
@@ -96,12 +97,14 @@ library VaultRebalance {
             );
             usdcSpent += spent;
         }
-        _recordEntry(b, e, a);
     }
 
-    /// @dev The pool's price now becomes its stop-loss basis.
-    function _recordEntry(VaultBook.Book storage b, VaultBook.Env memory e, Args memory a) private {
-        uint160 entry = VaultBook.sqrtPrice(b.poolMeta[a.poolId], e.stateView, a.poolId);
+    /// @dev The pool's reference price now becomes its stop-loss basis: the stop-loss values
+    /// the positions at the reference too, so only a move of the reference triggers it.
+    function _recordEntry(VaultBook.Book storage b, Args memory a, Limits memory l) private {
+        uint160 entry = TickMath.getSqrtPriceAtTick(
+            VaultBook.referenceTick(b, b.poolMeta[a.poolId], a.poolId, l.twapWindow, l.minObservations)
+        );
         b.entrySqrtPrice[a.poolId] = entry;
         b.lastRebalance[a.poolId] = block.timestamp;
         emit Rebalanced(a.poolId, a.spec.shape, a.spec.side, a.spec.ranges, a.spec.width, entry);

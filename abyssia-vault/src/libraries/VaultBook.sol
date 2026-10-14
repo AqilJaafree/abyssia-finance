@@ -194,30 +194,35 @@ library VaultBook {
     // Reference prices
     // ---------------------------------------------------------------------
 
-    /// @notice Post a hookless v4 pool's reference tick. The first post needs `canSet` (the
-    /// guardian); after that each post may move it at most `maxStep` ticks, at most once per
-    /// `interval` seconds.
+    /// @notice Post a hookless v4 pool's reference tick. The guardian may (re-)anchor it at
+    /// any time, but only to within `maxFromSpot` ticks of the pool's current tick (the first
+    /// post is the guardian's). The keeper may then move it at most `maxStep` ticks, at most
+    /// once per `interval` seconds after the last post by anyone.
     function postReferenceTick(
         Book storage b,
-        VaultRegistry registry,
+        Env memory e,
         bytes32 poolId,
         int24 tick,
-        bool canSet,
+        bool guardian,
         uint32 interval,
-        int24 maxStep
+        int24 maxStep,
+        int24 maxFromSpot
     ) external {
-        PoolMeta memory m = meta(b, registry, poolId);
+        PoolMeta memory m = meta(b, e.registry, poolId);
         if (m.protocol != Protocol.V4 || tick < TickMath.MIN_TICK || tick > TickMath.MAX_TICK) {
             revert InvalidReference(poolId, tick);
         }
         ReferenceTick storage r = b.referenceTick[poolId];
-        if (r.set) {
+        if (guardian) {
+            int24 spot = currentTick(m, e.stateView, poolId);
+            int24 off = tick > spot ? tick - spot : spot - tick;
+            if (off > maxFromSpot) revert InvalidReference(poolId, tick);
+        } else {
+            if (!r.set) revert NoReferencePrice(poolId);
             uint256 next = uint256(r.updatedAt) + interval;
             if (block.timestamp < next) revert ReferenceTooSoon(next);
             int24 step = tick > r.tick ? tick - r.tick : r.tick - tick;
             if (step > maxStep) revert ReferenceStepTooLarge(r.tick, tick);
-        } else if (!canSet) {
-            revert NoReferencePrice(poolId);
         }
         (r.tick, r.updatedAt, r.set) = (tick, uint40(block.timestamp), true);
         emit ReferenceTickPosted(poolId, tick);
