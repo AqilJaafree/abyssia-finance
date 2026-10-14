@@ -53,8 +53,9 @@ abstract contract VaultTestBase is Test {
     }
 
     function _settle() internal {
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
-        vault.settle();
+        vault.settle(price);
     }
 
     /// @dev Request, settle, and claim in one go; returns the shares received.

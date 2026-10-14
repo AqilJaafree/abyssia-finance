@@ -20,8 +20,7 @@ import {PoolPrice} from "./PoolPrice.sol";
 /// actually arrived.
 library VaultOps {
     uint256 internal constant BPS = 10_000;
-    /// @notice Hard cap on distinct non-USDC tokens held as inventory: one per position
-    /// (each position can leave fees or principal in its own token).
+    /// @notice Hard cap on distinct non-USDC tokens held as inventory (see reserveToken).
     uint256 internal constant MAX_TOKENS = VaultBook.MAX_POSITIONS;
 
     struct OpenArgs {
@@ -61,7 +60,7 @@ library VaultOps {
         VaultBook.Protocol indexed protocol, uint256 indexed tokenId, bytes32 indexed poolId
     );
     event PositionClosed(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
-    event TokenOwed(address indexed receiver, address indexed token, uint256 amount);
+    event TokenOwed(address indexed owner, address indexed token, uint256 amount);
 
     error InsufficientIdle(uint256 needed, uint256 available);
     error InsufficientInventory(address token, uint256 needed, uint256 available);
@@ -85,6 +84,9 @@ library VaultOps {
         (m, x.params, x.cls) = VaultBook.checkOpen(b, e, p.poolId, p.tickUpper - p.tickLower);
         if (p.usdcDesired > idle) revert InsufficientIdle(p.usdcDesired, idle);
         _requireInventory(b, m.token, p.tokenDesired);
+        // The position will pay out its token: hold its inventory slot from now on, so
+        // withdrawals, harvests and exit slices of it can never hit the token cap.
+        reserveToken(b, m.token, p.poolId);
         (uint256 a0, uint256 a1, uint256 min0, uint256 min1) = m.usdcIsToken0
             ? (p.usdcDesired, p.tokenDesired, p.usdcMin, p.tokenMin)
             : (p.tokenDesired, p.usdcDesired, p.tokenMin, p.usdcMin);
@@ -188,7 +190,8 @@ library VaultOps {
     }
 
     /// @notice One in-kind exit slice of one position, to `recipient` (the receiver, or the
-    /// vault as the IOU fallback, in which case what arrived is owed to `receiver`).
+    /// vault as the IOU fallback, in which case what arrived is owed to `owner`, the holder
+    /// whose shares were burned, who can claim it to any address).
     /// Fees a v4 slice harvests belong to the vault and are credited.
     /// @return usdcIn USDC fees received by the vault (credit it to idle)
     function slice(
@@ -198,7 +201,7 @@ library VaultOps {
         uint256 tokenId,
         uint256 shares,
         uint256 supply,
-        address receiver,
+        address owner,
         address recipient
     ) external returns (uint256 usdcIn) {
         VaultBook.PoolMeta memory m = _positionMeta(b, protocol, tokenId);
@@ -222,8 +225,8 @@ library VaultOps {
             usdcIn = _creditPair(b, m, f0, f1, b.positionPool[protocol][tokenId]);
         }
         if (recipient == address(this)) {
-            recordOwed(b, receiver, t0, got0);
-            recordOwed(b, receiver, t1, got1);
+            recordOwed(b, owner, t0, got0);
+            recordOwed(b, owner, t1, got1);
         }
     }
 
@@ -247,6 +250,7 @@ library VaultOps {
             if (a.amountIn > idle) revert InsufficientIdle(a.amountIn, idle);
         } else {
             m = VaultBook.meta(b, e.registry, a.poolId);
+            VaultBook.requireHookless(m, a.poolId);
             _requireInventory(b, m.token, a.amountIn);
         }
         uint160 sqrtP = VaultBook.sqrtPrice(m, e.stateView, a.poolId);
@@ -263,30 +267,46 @@ library VaultOps {
             (paid, out) =
                 VaultSwaps.swapV4(e.poolManager, m.v4Key, a.usdcIn == m.usdcIsToken0, a.amountIn, a.minOut);
         }
-        if (a.usdcIn) creditToken(b, m.token, out, a.poolId);
-        else _debitToken(b, m.token, paid);
+        if (a.usdcIn) {
+            reserveToken(b, m.token, a.poolId);
+            creditToken(b, m.token, out, a.poolId);
+        } else {
+            _debitToken(b, m.token, paid);
+        }
     }
 
     // ---------------------------------------------------------------------
     // Inventory and IOUs
     // ---------------------------------------------------------------------
 
+    /// @notice Make `token` an inventory token (priced via `poolId`) if it is not one yet.
+    /// Only the keeper's acquisitions (opening a position, buying a token) call this, and
+    /// they revert past MAX_TOKENS. Tokens still used by an open position are never pruned,
+    /// so a position's own credits always find their slot already reserved.
+    function reserveToken(VaultBook.Book storage b, address token, bytes32 poolId) public {
+        if (b.tokenPool[token] != bytes32(0)) return;
+        if (b.tokens.length >= MAX_TOKENS) _pruneTokens(b);
+        if (b.tokens.length >= MAX_TOKENS) revert TooManyTokens();
+        b.tokens.push(token);
+        b.tokenPool[token] = poolId;
+    }
+
+    /// @notice Credit inventory. Never reverts: a position's token was reserved when it was
+    /// opened (an unreserved one is added past the cap rather than losing the credit).
     function creditToken(VaultBook.Book storage b, address token, uint256 amount, bytes32 poolId) public {
         if (amount == 0) return;
         if (b.tokenPool[token] == bytes32(0)) {
-            if (b.tokens.length >= MAX_TOKENS) _pruneTokens(b);
-            if (b.tokens.length >= MAX_TOKENS) revert TooManyTokens();
             b.tokens.push(token);
             b.tokenPool[token] = poolId;
         }
         b.tokenBalance[token] += amount;
     }
 
-    function recordOwed(VaultBook.Book storage b, address receiver, address token, uint256 amount) public {
+    function recordOwed(VaultBook.Book storage b, address owner, address token, uint256 amount) public {
         if (amount == 0) return;
-        b.owed[receiver][token] += amount;
+        b.owed[owner][token] += amount;
         b.owedTotal[token] += amount;
-        emit TokenOwed(receiver, token, amount);
+        emit TokenOwed(owner, token, amount);
     }
 
     // ---------------------------------------------------------------------
@@ -317,13 +337,13 @@ library VaultOps {
         if (amount > bal) revert InsufficientInventory(token, amount, bal);
     }
 
-    /// @dev Drop inventory tokens whose balance reached zero.
+    /// @dev Drop inventory tokens whose balance reached zero and that no open position uses.
     function _pruneTokens(VaultBook.Book storage b) private {
         address[] storage tokens = b.tokens;
         uint256 i = 0;
         while (i < tokens.length) {
             address t = tokens[i];
-            if (b.tokenBalance[t] == 0) {
+            if (b.tokenBalance[t] == 0 && !_usedByPosition(b, t)) {
                 tokens[i] = tokens[tokens.length - 1];
                 tokens.pop();
                 delete b.tokenPool[t];
@@ -331,6 +351,18 @@ library VaultOps {
                 i++;
             }
         }
+    }
+
+    function _usedByPosition(VaultBook.Book storage b, address token) private view returns (bool) {
+        uint256 n3 = V3Positions.count(b.v3);
+        uint256 n = n3 + V4Positions.count(b.v4);
+        for (uint256 i = 0; i < n; i++) {
+            (VaultBook.Protocol protocol, uint256 id) = i < n3
+                ? (VaultBook.Protocol.V3, V3Positions.tokenIdAt(b.v3, i))
+                : (VaultBook.Protocol.V4, V4Positions.tokenIdAt(b.v4, i - n3));
+            if (b.poolMeta[b.positionPool[protocol][id]].token == token) return true;
+        }
+        return false;
     }
 
     function _positionMeta(VaultBook.Book storage b, VaultBook.Protocol protocol, uint256 tokenId)

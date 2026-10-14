@@ -85,7 +85,7 @@ contract AsyncBatchVaultHardeningTest is VaultTestBase {
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
-        vault.settle();
+        vault.settle(live);
 
         vm.prank(guardian);
         vault.settleAcceptingPriceMove(0.5e6, 100);

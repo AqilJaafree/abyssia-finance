@@ -19,7 +19,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
-        vault.settle();
+        vault.settle(live);
     }
 
     function test_priceDropBeyondGuardReverts() public {
@@ -28,7 +28,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
-        vault.settle();
+        vault.settle(live);
     }
 
     function test_guardianCanAcceptLargeMove() public {
@@ -44,13 +44,14 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
         vault.pause();
         vm.prank(keeper);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        vault.settle();
+        vault.settle(1e6);
     }
 
     function _settleGas() internal returns (uint256 used) {
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
         uint256 gasBefore = gasleft();
-        vault.settle();
+        vault.settle(price);
         used = gasBefore - gasleft();
     }
 

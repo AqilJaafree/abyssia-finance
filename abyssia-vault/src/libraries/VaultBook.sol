@@ -94,8 +94,9 @@ library VaultBook {
         b.poolMeta[poolId] = m;
     }
 
-    /// @notice A pool new exposure may go to: registry-usable, hookless (v4), and its class
-    /// not frozen (some shape allowed and a non-zero allocation).
+    /// @notice A pool new exposure may go to (a position, or tokens bought in it):
+    /// registry-usable, hookless (v4), deep enough (minPoolLiquidity), and its class not
+    /// frozen (some shape allowed and a non-zero allocation).
     function usablePool(Book storage b, Env memory e, bytes32 poolId)
         public
         returns (PoolMeta memory m, VaultRegistry.ClassParams memory cp, VaultRegistry.AssetClass cls)
@@ -104,14 +105,22 @@ library VaultBook {
             revert PoolNotUsable(poolId);
         }
         m = meta(b, e.registry, poolId);
-        if (m.protocol == Protocol.V4 && m.v4Key.hooks != address(0)) revert HookedPoolNotAllowed(poolId);
+        requireHookless(m, poolId);
         cls = e.registry.getPool(poolId).assetClass;
         cp = e.registry.classParams(cls);
         if (cp.allowedShapes == 0 || cp.maxAllocationBps == 0) revert PoolNotUsable(poolId);
+        uint128 liq = m.protocol == Protocol.V3
+            ? IUniswapV3Pool(m.v3Pool).liquidity()
+            : e.stateView.getLiquidity(poolId);
+        if (liq < cp.minPoolLiquidity) revert PoolTooThin(liq, cp.minPoolLiquidity);
     }
 
-    /// @notice Checks for one new range in `poolId`: the pool is usable, the width is
-    /// within the class bounds, the position caps hold and the pool is deep enough.
+    function requireHookless(PoolMeta memory m, bytes32 poolId) internal pure {
+        if (m.protocol == Protocol.V4 && m.v4Key.hooks != address(0)) revert HookedPoolNotAllowed(poolId);
+    }
+
+    /// @notice Checks for one new range in `poolId`: the pool is usable (see usablePool),
+    /// the width is within the class bounds and the position caps hold.
     function checkOpen(Book storage b, Env memory e, bytes32 poolId, int24 width)
         external
         returns (PoolMeta memory m, VaultRegistry.ClassParams memory cp, VaultRegistry.AssetClass cls)
@@ -120,14 +129,13 @@ library VaultBook {
         if (width < cp.minWidthTicks || width > cp.maxWidthTicks) revert WidthOutOfBounds(width);
         if (V3Positions.count(b.v3) + V4Positions.count(b.v4) >= MAX_POSITIONS) revert TooManyPositions();
         if (_rangesIn(b, m.protocol, poolId) >= cp.maxRanges) revert TooManyRanges(poolId);
-        uint128 liq = m.protocol == Protocol.V3
-            ? IUniswapV3Pool(m.v3Pool).liquidity()
-            : e.stateView.getLiquidity(poolId);
-        if (liq < cp.minPoolLiquidity) revert PoolTooThin(liq, cp.minPoolLiquidity);
     }
 
-    /// @notice After adding exposure to `poolId`: its value (positions + its token's
-    /// inventory) must stay within maxAllocationBps of `nav`, and its class within maxClassBps.
+    /// @notice After adding exposure to `poolId`: its value (its positions + ALL inventory
+    /// of its token) must stay within maxAllocationBps of `nav`, and its class within
+    /// maxClassBps. Inventory counts toward the class of the pool that prices it
+    /// (`tokenPool`), so when that pool is a different one it is checked too: buying a token
+    /// through a second pool can never escape the first pool's or class's limits.
     function checkAllocation(
         Book storage b,
         Env memory e,
@@ -136,6 +144,22 @@ library VaultBook {
         VaultRegistry.ClassParams memory cp,
         uint256 nav
     ) external view {
+        _checkLimits(b, e, poolId, cls, cp, nav);
+        bytes32 pricing = b.tokenPool[b.poolMeta[poolId].token];
+        if (pricing != bytes32(0) && pricing != poolId) {
+            VaultRegistry.AssetClass pcls = e.registry.getPool(pricing).assetClass;
+            _checkLimits(b, e, pricing, pcls, e.registry.classParams(pcls), nav);
+        }
+    }
+
+    function _checkLimits(
+        Book storage b,
+        Env memory e,
+        bytes32 poolId,
+        VaultRegistry.AssetClass cls,
+        VaultRegistry.ClassParams memory cp,
+        uint256 nav
+    ) private view {
         (uint256 poolValue, uint256 classValue) = _exposure(b, e, poolId, cls);
         uint256 poolLimit = nav * cp.maxAllocationBps / BPS;
         if (poolValue > poolLimit) revert AllocationExceeded(poolValue, poolLimit);
@@ -225,14 +249,14 @@ library VaultBook {
             if (pid == poolId) poolValue += v;
             if (e.registry.getPool(pid).assetClass == cls) classValue += v;
         }
+        address poolToken = b.poolMeta[poolId].token;
         uint256 nt = b.tokens.length;
         for (uint256 i = 0; i < nt; i++) {
             address t = b.tokens[i];
             uint256 v = tokenValue(b, e, t);
             if (v == 0) continue;
-            bytes32 pid = b.tokenPool[t];
-            if (pid == poolId) poolValue += v;
-            if (e.registry.getPool(pid).assetClass == cls) classValue += v;
+            if (t == poolToken) poolValue += v;
+            if (e.registry.getPool(b.tokenPool[t]).assetClass == cls) classValue += v;
         }
     }
 }

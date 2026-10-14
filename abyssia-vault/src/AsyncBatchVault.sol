@@ -30,6 +30,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @dev Hard caps, in asset base units (6 decimals) / bps. The admin can never exceed these.
     uint256 public constant MAX_MIN_DEPOSIT = 100e6; // 100 USDC
     uint256 public constant MAX_CYCLE_MOVE_BPS_CAP = 5_000; // 50%
+    /// @dev Hard cap on how far the live share price may sit from the keeper's expected price.
+    uint256 public constant MAX_SETTLE_TOLERANCE_BPS = 200; // 2%
 
     struct Batch {
         uint128 depositAssets; // USDC requested for deposit in this batch
@@ -57,6 +59,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public maxCycleMoveBps;
     /// @notice Share price (assets per 10**decimals() shares) at the last settlement; 0 before the first.
     uint256 public lastSharePrice;
+    /// @notice The keeper's `settle(expectedPrice)` reverts unless the live share price is
+    /// within this many bps of `expectedPrice`.
+    uint256 public settleToleranceBps = 50;
     /// @notice ERC-7540 operators: `operator` may cancel and claim on behalf of `controller`
     /// (and choose the receiver), so approving one is full trust over those requests.
     mapping(address controller => mapping(address operator => bool)) public isOperator;
@@ -79,6 +84,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     event MinDepositSet(uint256 value);
     event MaxTotalAssetsSet(uint256 value);
     event MaxCycleMoveBpsSet(uint256 value);
+    event SettleToleranceBpsSet(uint256 value);
     event SurplusSwept(address indexed to, uint256 surplus);
     event OperatorSet(address indexed controller, address indexed operator, bool approved);
 
@@ -221,6 +227,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     }
 
     function _cancelDeposit(address controller, address receiver) private {
+        _checkUsdcReceiver(receiver);
         uint256 id = currentBatchId;
         uint256 assets = depositRequestOf[id][controller];
         if (assets == 0) revert NothingToCancel();
@@ -269,13 +276,17 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     // Settlement
     // ---------------------------------------------------------------------
 
-    /// @notice Settle the open batch at the current share price. Reverts if the price
-    /// moved more than maxCycleMoveBps since the last settlement. The guard is skipped
-    /// on the first settlement and whenever the share supply is zero.
+    /// @notice Settle the open batch at the current share price. Reverts unless the live
+    /// price is within settleToleranceBps of `expectedPrice` (the keeper's off-chain fair
+    /// price: NAV from fair token prices, including fees about to be harvested), so a
+    /// sandwich that moves pool prices around this call makes it revert instead of settling
+    /// at a manipulated NAV. Also reverts if the price moved more than maxCycleMoveBps since
+    /// the last settlement (skipped on the first settlement and whenever the supply is zero).
     /// @dev Requests in the open batch can be cancelled until this lands (a later plan
     /// may add a pre-settlement cancel cutoff).
-    function settle() external onlyRole(KEEPER_ROLE) {
-        _settle(false, 0, 0);
+    function settle(uint256 expectedPrice) external onlyRole(KEEPER_ROLE) {
+        if (expectedPrice == 0) revert ParamOutOfBounds();
+        _settle(false, expectedPrice, settleToleranceBps);
     }
 
     /// @notice Settle even though the price moved more than maxCycleMoveBps — for a
@@ -302,16 +313,15 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         Batch storage b = batches[id];
 
         uint256 price = _sharePrice();
-        if (guardianOverride) {
-            uint256 diff = price > expectedPrice ? price - expectedPrice : expectedPrice - price;
-            if (diff * BPS > expectedPrice * toleranceBps) revert PriceNotAsExpected(expectedPrice, price);
-        } else {
+        uint256 diff = price > expectedPrice ? price - expectedPrice : expectedPrice - price;
+        if (diff * BPS > expectedPrice * toleranceBps) revert PriceNotAsExpected(expectedPrice, price);
+        if (!guardianOverride) {
             uint256 last = lastSharePrice;
             // No guard on the first settlement, nor once the vault has emptied (supply 0):
             // the last price no longer describes any outstanding shares.
             if (last != 0 && totalSupply() != 0) {
-                uint256 diff = price > last ? price - last : last - price;
-                if (diff * BPS > last * maxCycleMoveBps) revert PriceMoveTooLarge(last, price);
+                uint256 move = price > last ? price - last : last - price;
+                if (move * BPS > last * maxCycleMoveBps) revert PriceMoveTooLarge(last, price);
             }
         }
 
@@ -392,6 +402,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         private
         returns (uint256 assets)
     {
+        _checkUsdcReceiver(receiver);
         Batch storage b = batches[batchId];
         if (!b.settled) revert BatchNotSettled(batchId);
         uint256 shares = redeemRequestOf[batchId][controller];
@@ -413,6 +424,11 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         isOperator[msg.sender][operator] = approved;
         emit OperatorSet(msg.sender, operator, approved);
         return true;
+    }
+
+    /// @dev USDC paid to the vault itself would turn into sweepable surplus.
+    function _checkUsdcReceiver(address receiver) private view {
+        if (receiver == address(0) || receiver == address(this)) revert ZeroAddress();
     }
 
     function _requireOperator(address controller) private view {
@@ -459,6 +475,19 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
     function setMaxCycleMoveBps(uint256 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _setMaxCycleMoveBps(value);
+    }
+
+    function setSettleToleranceBps(uint256 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (value == 0 || value > MAX_SETTLE_TOLERANCE_BPS) revert ParamOutOfBounds();
+        settleToleranceBps = value;
+        emit SettleToleranceBpsSet(value);
+    }
+
+    /// @notice Guardian may only tighten the keeper's settle tolerance, instantly.
+    function lowerSettleToleranceBps(uint256 value) external onlyRole(GUARDIAN_ROLE) {
+        if (value >= settleToleranceBps || value == 0) revert NotLower();
+        settleToleranceBps = value;
+        emit SettleToleranceBpsSet(value);
     }
 
     /// @notice Guardian may only tighten the deposit cap, instantly.

@@ -66,7 +66,8 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
     }
 
     /// The receiver is blocked on one token: that pool's slice is taken into the vault and
-    /// owed (both sides, including USDC), claimable later; sweepSurplus never touches it.
+    /// owed to the share OWNER (both sides, including USDC), who claims it to any address;
+    /// sweepSurplus never touches it.
     function test_blockedReceiverGetsIouAndSurplusExcludesIt() public {
         MockFreezableERC20 hostile = new MockFreezableERC20("Hostile", "HOS");
         (, bytes32 poolId) = _addV4Pool(address(hostile));
@@ -77,8 +78,9 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
         vm.prank(alice);
         vault.redeemInKind(half, receiver);
 
-        uint256 owedUsdc = vault.owed(receiver, address(usdc));
-        uint256 owedHostile = vault.owed(receiver, address(hostile));
+        assertEq(vault.owed(receiver, address(usdc)), 0);
+        uint256 owedUsdc = vault.owed(alice, address(usdc));
+        uint256 owedHostile = vault.owed(alice, address(hostile));
         assertGt(owedUsdc, 0);
         assertGt(owedHostile, 0);
         assertEq(vault.owedTotal(address(usdc)), owedUsdc);
@@ -88,13 +90,15 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
         vm.prank(admin);
         assertEq(vault.sweepSurplus(admin), 7e6);
 
-        vm.prank(receiver);
-        vault.claimOwed(address(usdc), receiver);
+        uint256 aliceUsdc = usdc.balanceOf(alice);
+        vm.startPrank(alice);
+        vault.claimOwed(address(usdc), alice);
+        assertEq(usdc.balanceOf(alice), aliceUsdc + owedUsdc);
         assertEq(vault.owedTotal(address(usdc)), 0);
-        hostile.setBlocked(receiver, false);
-        vm.prank(receiver);
-        vault.claimOwed(address(hostile), receiver);
-        assertEq(hostile.balanceOf(receiver), owedHostile);
+        // Still blocked for the receiver, so the owner claims the token elsewhere.
+        vault.claimOwed(address(hostile), alice);
+        vm.stopPrank();
+        assertEq(hostile.balanceOf(alice), owedHostile);
     }
 
     /// An inventory token the receiver cannot take is owed instead (exact amount).
@@ -109,7 +113,7 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
         vm.prank(alice);
         vault.redeemInKind(shares, receiver);
 
-        assertEq(vault.owed(receiver, address(hostile)), got * shares / supply);
+        assertEq(vault.owed(alice, address(hostile)), got * shares / supply);
         assertEq(vault.tokenBalance(address(hostile)), got - got * shares / supply);
     }
 
@@ -144,7 +148,10 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
         uint256 shares = vault.balanceOf(alice) / 2;
         vm.expectCall(
             address(vault),
-            abi.encodeCall(vault.exitSlice, (P4, idB, shares, vault.totalSupply(), receiver, address(vault))),
+            abi.encodeCall(
+                vault.exitSlice,
+                (P4, idB, AbyssiaVault.Exit(shares, vault.totalSupply(), receiver, alice), address(vault))
+            ),
             uint64(0)
         );
         uint256 g = gasleft();
@@ -166,20 +173,21 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
 
     function test_exitEntrypointsAreSelfAndBoundOnly() public {
         vm.expectRevert(AbyssiaVault.OnlySelf.selector);
-        vault.exitSlice(P3, id3, 1, 2, receiver, receiver);
+        vault.exitSlice(P3, id3, AbyssiaVault.Exit(1, 2, receiver, alice), receiver);
         vm.expectRevert(AbyssiaVault.OnlySelf.selector);
-        vault.exitTransfer(address(meme), 1, 1, 2, receiver);
+        vault.exitTransfer(address(meme), 1, AbyssiaVault.Exit(1, 2, receiver, alice));
         vm.startPrank(address(vault)); // self, but no exit in progress
         vm.expectRevert(AbyssiaVault.UnboundSlice.selector);
-        vault.exitSlice(P3, id3, 1, 2, receiver, receiver);
+        vault.exitSlice(P3, id3, AbyssiaVault.Exit(1, 2, receiver, alice), receiver);
         vm.expectRevert(AbyssiaVault.UnboundSlice.selector);
-        vault.exitTransfer(address(meme), 1, 1, 2, receiver);
+        vault.exitTransfer(address(meme), 1, AbyssiaVault.Exit(1, 2, receiver, alice));
         vm.stopPrank();
     }
 
     /// Worst case at the cap: MAX_POSITIONS positions across v3 and v4, every token a
     /// two-stage burner that fails just under the fallback threshold to the receiver and
-    /// then burns the whole budget on the vault fallback. Must stay well under Arc's 30M.
+    /// then burns the whole budget on the vault fallback, and every burner also held as
+    /// inventory (its transfer burns TOKEN_GAS). Must stay well under Arc's 30M.
     function test_worstCaseExitGasAtMaxPositions() public {
         // A larger NAV so 20 small positions fit the class allocation limit.
         _deposit(bob, 100_000e6);
@@ -194,6 +202,7 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
             if (i % 2 == 0) (, poolId) = _addV3Pool(address(ts[k]));
             else (, poolId) = _addV4Pool(address(ts[k]));
             uint256 id = _openInRange(poolId, 50e6);
+            _keeperSwap(poolId, true, 5e6); // also held as inventory: a hostile transfer in the token loop
             if (k == 0) firstBurnerId = id;
             k++;
         }
@@ -209,7 +218,13 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
         vm.expectCall(
             address(vault),
             abi.encodeCall(
-                vault.exitSlice, (P3, firstBurnerId, shares, vault.totalSupply(), receiver, address(vault))
+                vault.exitSlice,
+                (
+                    P3,
+                    firstBurnerId,
+                    AbyssiaVault.Exit(shares, vault.totalSupply(), receiver, bob),
+                    address(vault)
+                )
             ),
             uint64(1)
         );

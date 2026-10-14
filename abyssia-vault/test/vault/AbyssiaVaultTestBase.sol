@@ -172,9 +172,11 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         vm.stopPrank();
     }
 
+    /// @dev Settles at the live price (in tests the pool prices are the fair prices).
     function _settle() internal {
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
-        vault.settle();
+        vault.settle(price);
     }
 
     /// @dev Deposit `assets` for `user`, settle and claim; returns the shares.

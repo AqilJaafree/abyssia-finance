@@ -25,6 +25,12 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// is always available. The keeper opens, withdraws and closes positions, collects fees
 /// and swaps between USDC and a pool's token, always within the registry's class limits,
 /// only in hookless v4 pools, and never sending assets anywhere but the vault.
+/// TRUST: the keeper is trusted within these bounds, not beyond them. Spot-price checks
+/// bound price impact, not manipulation: a compromised keeper colluding with someone who
+/// moves a pool's price can open, withdraw or swap at that price (up to the pool's
+/// allocation), and the keeper picks the expected price each settlement is checked against.
+/// Run the keeper with private transaction submission and off-chain fair prices; a later
+/// plan adds TWAP bounds and a minimum interval between settlements.
 /// @dev Accounting never takes token balances as truth: idle USDC (`idleAssets`) and token
 /// inventory (`tokenBalance`) are tracked internally, and every credit is the smaller of
 /// the balance delta and the amount Uniswap's own math reports. The book, its checks and
@@ -37,8 +43,8 @@ contract AbyssiaVault is AsyncBatchVault {
     using TransientSlot for TransientSlot.BooleanSlot;
 
     /// @notice Hard cap on open positions across v3 AND v4. Sized from the measured worst
-    /// case of an in-kind exit (~820k gas per hostile position under the 60% fallback
-    /// rule), so a full exit stays well under Arc's 30M block gas limit.
+    /// case of an in-kind exit (20 hostile positions that also sit in inventory: ~16.2M
+    /// gas), so a full exit stays well under Arc's 30M block gas limit.
     uint256 public constant MAX_POSITIONS = VaultBook.MAX_POSITIONS;
     /// @notice Hard cap on distinct non-USDC tokens held as inventory.
     uint256 public constant MAX_TOKENS = VaultOps.MAX_TOKENS;
@@ -96,13 +102,14 @@ contract AbyssiaVault is AsyncBatchVault {
     event HarvestSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event OwedClaimed(address indexed receiver, address indexed token, address to, uint256 amount);
     event MaxSwapSlippageBpsSet(uint256 value);
+    event TokenSurplusSwept(address indexed token, address indexed to, uint256 surplus);
     // Library events and errors, re-declared so indexers and clients can decode them from
     // the vault's ABI.
     event PositionOpened(
         VaultBook.Protocol indexed protocol, uint256 indexed tokenId, bytes32 indexed poolId
     );
     event PositionClosed(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
-    event TokenOwed(address indexed receiver, address indexed token, uint256 amount);
+    event TokenOwed(address indexed owner, address indexed token, uint256 amount);
     event Swapped(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event V3PositionOpened(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
     event V3LiquidityWithdrawn(
@@ -134,6 +141,16 @@ contract AbyssiaVault is AsyncBatchVault {
     error InsufficientGas();
     error InvalidReceiver();
     error OnlyPoolManager();
+    // Adapter and swap library errors.
+    error Slippage(uint256 spent0, uint256 spent1);
+    error PositionNotEmpty(uint256 tokenId);
+    error InvalidSlice();
+    error InvalidRecipient();
+    error NativeCurrencyNotSupported();
+    error PoolNotInitialized();
+    error ZeroLiquidity();
+    error InsufficientOutput(uint256 out, uint256 minOut);
+    error UnexpectedCallback();
 
     constructor(Config memory c)
         AsyncBatchVault(
@@ -247,7 +264,8 @@ contract AbyssiaVault is AsyncBatchVault {
     // IOUs
     // ---------------------------------------------------------------------
 
-    /// @notice Claim tokens owed to you from an in-kind exit whose receiver refused them.
+    /// @notice Claim tokens owed to you (the holder who exited in kind) because your
+    /// receiver could not take them, to any address.
     function claimOwed(address token, address to) external nonReentrant returns (uint256 amount) {
         if (to == address(0) || to == address(this)) revert InvalidReceiver();
         amount = _book.owed[msg.sender][token];
@@ -255,6 +273,20 @@ contract AbyssiaVault is AsyncBatchVault {
         _book.owedTotal[token] -= amount;
         IERC20(token).safeTransfer(to, amount);
         emit OwedClaimed(msg.sender, token, to, amount);
+    }
+
+    /// @notice Send out non-USDC tokens the vault holds beyond its books (donations, rounding
+    /// dust): balance - inventory - IOUs. USDC surplus goes through `sweepSurplus`.
+    function sweepTokenSurplus(address token, address to)
+        external
+        nonReentrant
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        returns (uint256 surplus)
+    {
+        if (token == usdcToken || to == address(0)) revert ZeroAddress();
+        surplus = IERC20(token).balanceOf(address(this)) - _book.tokenBalance[token] - _book.owedTotal[token];
+        IERC20(token).safeTransfer(to, surplus);
+        emit TokenSurplusSwept(token, to, surplus);
     }
 
     // ---------------------------------------------------------------------
@@ -371,37 +403,43 @@ contract AbyssiaVault is AsyncBatchVault {
     // In-kind exit
     // ---------------------------------------------------------------------
 
+    /// @notice One in-kind exit: `shares` of `supply` (before the burn), paid to `receiver`,
+    /// IOUs owed to `owner` (the holder whose shares were burned).
+    struct Exit {
+        uint256 shares;
+        uint256 supply;
+        address receiver;
+        address owner;
+    }
+
     /// @dev Per position and per inventory token: deliver the slice to `receiver`; if that
-    /// failed cheaply, take it into the vault and record an IOU; if even that fails (or
-    /// the first attempt burned its gas), leave it to the remaining holders. Bookkeeping
-    /// runs inside the gas-capped self-call frames and every credit is capped by Uniswap's
-    /// math, so a hostile token can only affect its own slice.
+    /// failed cheaply, take it into the vault and record an IOU for the owner; if even that
+    /// fails (or the first attempt burned its gas), leave it to the remaining holders.
+    /// Bookkeeping runs inside the gas-capped self-call frames and every credit is capped by
+    /// Uniswap's math, so a hostile token can only affect its own slice.
     function _redeemPositionsInKind(uint256 shares, uint256 supply, address receiver) internal override {
         _checkReceiver(receiver);
         if (_exitBinding() != bytes32(0)) revert ExitInProgress();
-        EXIT_BINDING.asBytes32().tstore(keccak256(abi.encode(shares, supply, receiver)));
+        // AsyncBatchVault.redeemInKind burned the shares from msg.sender: IOUs go to them,
+        // not to a receiver that may be unable to claim.
+        Exit memory x = Exit(shares, supply, receiver, msg.sender);
+        EXIT_BINDING.asBytes32().tstore(keccak256(abi.encode(x)));
         (uint256 n3, uint256 n4) = positionCount();
         for (uint256 i = 0; i < n3 + n4; i++) {
             VaultBook.Protocol protocol = i < n3 ? VaultBook.Protocol.V3 : VaultBook.Protocol.V4;
-            _exitPosition(protocol, positionAt(protocol, i < n3 ? i : i - n3), shares, supply, receiver);
+            _exitPosition(protocol, positionAt(protocol, i < n3 ? i : i - n3), x);
         }
         uint256 nt = _book.tokens.length;
         for (uint256 i = 0; i < nt; i++) {
-            _exitToken(_book.tokens[i], shares, supply, receiver);
+            _exitToken(_book.tokens[i], x);
         }
         EXIT_BINDING.asBytes32().tstore(bytes32(0));
     }
 
-    function _exitPosition(
-        VaultBook.Protocol protocol,
-        uint256 tokenId,
-        uint256 shares,
-        uint256 supply,
-        address receiver
-    ) private {
+    function _exitPosition(VaultBook.Protocol protocol, uint256 tokenId, Exit memory x) private {
         _requireGas(SLICE_GAS);
         uint256 gasBefore = gasleft();
-        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, shares, supply, receiver, receiver) {
+        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, x, x.receiver) {
             return;
         } catch {}
         if (gasBefore - gasleft() > SLICE_GAS * FALLBACK_MAX_BPS / BPS) {
@@ -409,7 +447,7 @@ contract AbyssiaVault is AsyncBatchVault {
             return;
         }
         _requireGas(SLICE_GAS);
-        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, shares, supply, receiver, address(this)) {}
+        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, x, address(this)) {}
         catch {
             emit SliceSkipped(protocol, tokenId);
         }
@@ -417,38 +455,34 @@ contract AbyssiaVault is AsyncBatchVault {
 
     /// @dev Inventory share: debited first; if the transfer fails it is owed instead (the
     /// tokens never left, so the IOU is exact).
-    function _exitToken(address token, uint256 shares, uint256 supply, address receiver) private {
-        uint256 amount = Math.mulDiv(_book.tokenBalance[token], shares, supply);
+    function _exitToken(address token, Exit memory x) private {
+        uint256 amount = Math.mulDiv(_book.tokenBalance[token], x.shares, x.supply);
         if (amount == 0) return;
         _book.tokenBalance[token] -= amount;
         _requireGas(TOKEN_GAS);
-        try this.exitTransfer{gas: TOKEN_GAS}(token, amount, shares, supply, receiver) {}
+        try this.exitTransfer{gas: TOKEN_GAS}(token, amount, x) {}
         catch {
-            VaultOps.recordOwed(_book, receiver, token, amount);
+            VaultOps.recordOwed(_book, x.owner, token, amount);
         }
     }
 
     /// @notice Self-call target of the in-kind exit: one position's slice. Bound to the
-    /// exit in progress; pays `receiver` or, as the fallback, the vault (recording an IOU).
-    function exitSlice(
-        VaultBook.Protocol protocol,
-        uint256 tokenId,
-        uint256 shares,
-        uint256 supply,
-        address receiver,
-        address recipient
-    ) external {
-        _requireBound(shares, supply, receiver);
-        if (recipient != receiver && recipient != address(this)) revert UnboundSlice();
-        _increaseIdle(VaultOps.slice(_book, _env(), protocol, tokenId, shares, supply, receiver, recipient));
+    /// exit in progress; pays the receiver or, as the fallback, the vault (recording an IOU
+    /// for the owner).
+    function exitSlice(VaultBook.Protocol protocol, uint256 tokenId, Exit calldata x, address recipient)
+        external
+    {
+        _requireBound(x);
+        if (recipient != x.receiver && recipient != address(this)) revert UnboundSlice();
+        _increaseIdle(
+            VaultOps.slice(_book, _env(), protocol, tokenId, x.shares, x.supply, x.owner, recipient)
+        );
     }
 
     /// @notice Self-call target of the in-kind exit: one inventory token transfer.
-    function exitTransfer(address token, uint256 amount, uint256 shares, uint256 supply, address receiver)
-        external
-    {
-        _requireBound(shares, supply, receiver);
-        IERC20(token).safeTransfer(receiver, amount);
+    function exitTransfer(address token, uint256 amount, Exit calldata x) external {
+        _requireBound(x);
+        IERC20(token).safeTransfer(x.receiver, amount);
     }
 
     // ---------------------------------------------------------------------
@@ -470,9 +504,9 @@ contract AbyssiaVault is AsyncBatchVault {
         ) revert InvalidReceiver();
     }
 
-    function _requireBound(uint256 shares, uint256 supply, address receiver) private view {
+    function _requireBound(Exit calldata x) private view {
         if (msg.sender != address(this)) revert OnlySelf();
-        if (_exitBinding() != keccak256(abi.encode(shares, supply, receiver))) revert UnboundSlice();
+        if (_exitBinding() != keccak256(abi.encode(x))) revert UnboundSlice();
     }
 
     function _exitBinding() private view returns (bytes32) {

@@ -101,8 +101,9 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
         usdc.approve(address(vault), 10_000e6);
         vault.requestDeposit(10_000e6);
         vm.stopPrank();
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
-        vault.settle();
+        vault.settle(price);
         vm.prank(alice);
         vault.claimDeposit(1, alice);
 
@@ -116,8 +117,9 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
         _traderSwap(address(meme), 500e6);
         _traderSwap(address(usdc), 500e6);
         uint256 idleBefore = vault.idleAssets();
+        price = vault.sharePrice();
         vm.prank(keeper);
-        vault.settle();
+        vault.settle(price);
         assertGt(vault.idleAssets(), idleBefore);
 
         address receiver = makeAddr("receiver");

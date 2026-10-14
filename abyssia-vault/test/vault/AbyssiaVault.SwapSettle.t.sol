@@ -135,9 +135,10 @@ contract AbyssiaVaultSwapSettleTest is AbyssiaVaultTestBase {
         uint256 shares = vault.balanceOf(alice);
         vm.prank(alice);
         vault.requestRedeem(shares * 9 / 10);
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vm.expectPartialRevert(AsyncBatchVault.InsufficientIdle.selector);
-        vault.settle();
+        vault.settle(price);
 
         (,,,,,,, uint128 liq,,,,) = vault.npm().positions(id);
         vm.startPrank(keeper);

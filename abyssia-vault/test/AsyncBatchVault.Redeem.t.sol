@@ -79,11 +79,12 @@ contract AsyncBatchVaultRedeemTest is VaultTestBase {
         deal(address(usdc), address(vault), 10 * USDC);
         vm.prank(alice);
         vault.requestRedeem(shares);
+        uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(
             abi.encodeWithSelector(AsyncBatchVault.InsufficientIdle.selector, 100 * USDC, 10 * USDC)
         );
-        vault.settle();
+        vault.settle(price);
     }
 
     function test_claimRedeemWorksWhenPaused() public {
