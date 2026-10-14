@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {AbyssiaVaultTestBase} from "./AbyssiaVaultTestBase.sol";
+import {VaultExit} from "../../src/libraries/VaultExit.sol";
 import {AbyssiaVault} from "../../src/AbyssiaVault.sol";
 import {VaultBook} from "../../src/libraries/VaultBook.sol";
 import {VaultRegistry} from "../../src/registry/VaultRegistry.sol";
@@ -150,7 +151,7 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
             address(vault),
             abi.encodeCall(
                 vault.exitSlice,
-                (P4, idB, AbyssiaVault.Exit(shares, vault.totalSupply(), receiver, alice), address(vault))
+                (P4, idB, VaultExit.Exit(shares, vault.totalSupply(), receiver, alice), address(vault))
             ),
             uint64(0)
         );
@@ -173,14 +174,14 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
 
     function test_exitEntrypointsAreSelfAndBoundOnly() public {
         vm.expectRevert(AbyssiaVault.OnlySelf.selector);
-        vault.exitSlice(P3, id3, AbyssiaVault.Exit(1, 2, receiver, alice), receiver);
+        vault.exitSlice(P3, id3, VaultExit.Exit(1, 2, receiver, alice), receiver);
         vm.expectRevert(AbyssiaVault.OnlySelf.selector);
-        vault.exitTransfer(address(meme), 1, AbyssiaVault.Exit(1, 2, receiver, alice));
+        vault.exitTransfer(address(meme), 1, VaultExit.Exit(1, 2, receiver, alice));
         vm.startPrank(address(vault)); // self, but no exit in progress
         vm.expectRevert(AbyssiaVault.UnboundSlice.selector);
-        vault.exitSlice(P3, id3, AbyssiaVault.Exit(1, 2, receiver, alice), receiver);
+        vault.exitSlice(P3, id3, VaultExit.Exit(1, 2, receiver, alice), receiver);
         vm.expectRevert(AbyssiaVault.UnboundSlice.selector);
-        vault.exitTransfer(address(meme), 1, AbyssiaVault.Exit(1, 2, receiver, alice));
+        vault.exitTransfer(address(meme), 1, VaultExit.Exit(1, 2, receiver, alice));
         vm.stopPrank();
     }
 
@@ -222,7 +223,7 @@ contract AbyssiaVaultInKindTest is AbyssiaVaultTestBase {
                 (
                     P3,
                     firstBurnerId,
-                    AbyssiaVault.Exit(shares, vault.totalSupply(), receiver, bob),
+                    VaultExit.Exit(shares, vault.totalSupply(), receiver, bob),
                     address(vault)
                 )
             ),

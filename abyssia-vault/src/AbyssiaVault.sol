@@ -13,6 +13,7 @@ import {VaultSwaps} from "./libraries/VaultSwaps.sol";
 import {VaultBook} from "./libraries/VaultBook.sol";
 import {VaultOps} from "./libraries/VaultOps.sol";
 import {VaultRebalance} from "./libraries/VaultRebalance.sol";
+import {VaultExit} from "./libraries/VaultExit.sol";
 import {INonfungiblePositionManager as INPM} from "./interfaces/INonfungiblePositionManager.sol";
 import {IV4PositionManager} from "./interfaces/IV4PositionManager.sol";
 import {IV4PoolManager} from "./interfaces/IV4PoolManager.sol";
@@ -67,19 +68,6 @@ contract AbyssiaVault is AsyncBatchVault {
     /// @notice Bounds of the v3 TWAP window.
     uint32 public constant MIN_TWAP_WINDOW = 60;
     uint32 public constant MAX_TWAP_WINDOW = 1 hours;
-    /// @notice Gas budget of ONE in-kind slice attempt (a normal slice uses ~170-200k).
-    uint256 public constant SLICE_GAS = 500_000;
-    /// @notice Gas budget of ONE inventory-token transfer in an in-kind exit.
-    uint256 public constant TOKEN_GAS = 100_000;
-    /// @notice Gas budget of ONE fee harvest at settlement.
-    uint256 public constant HARVEST_GAS = 400_000;
-    /// @notice Kept back on top of a capped call's budget * 64/63.
-    uint256 public constant GAS_RESERVE = 50_000;
-    /// @notice Retry an in-kind slice with the vault as recipient only if the failed
-    /// attempt used at most this share of SLICE_GAS: an honest refusal fails early, a gas
-    /// burner uses nearly everything at any call depth.
-    uint256 public constant FALLBACK_MAX_BPS = 6_000;
-
     /// @dev keccak256(abi.encode(shares, supply, receiver)) during an in-kind exit.
     bytes32 internal constant EXIT_BINDING = keccak256("abyssia.AbyssiaVault.exitBinding");
     /// @dev Set while `_beforeSettle` harvests.
@@ -491,19 +479,11 @@ contract AbyssiaVault is AsyncBatchVault {
     function _ensureIdle(uint256) internal override {}
 
     /// @dev Harvest every position's fees before NAV is computed. Each harvest runs in a
-    /// gas-capped self-call, so a frozen or hostile token can only skip its own harvest.
+    /// gas-capped self-call (VaultExit.harvestAll), so a frozen or hostile token can only
+    /// skip its own harvest.
     function _beforeSettle() internal override {
         HARVESTING.asBoolean().tstore(true);
-        (uint256 n3, uint256 n4) = positionCount();
-        for (uint256 i = 0; i < n3 + n4; i++) {
-            VaultBook.Protocol protocol = i < n3 ? VaultBook.Protocol.V3 : VaultBook.Protocol.V4;
-            uint256 tokenId = positionAt(protocol, i < n3 ? i : i - n3);
-            _requireGas(HARVEST_GAS);
-            try this.harvestFor{gas: HARVEST_GAS}(protocol, tokenId) {}
-            catch {
-                emit HarvestSkipped(protocol, tokenId);
-            }
-        }
+        VaultExit.harvestAll(_book);
         HARVESTING.asBoolean().tstore(false);
     }
 
@@ -522,75 +502,31 @@ contract AbyssiaVault is AsyncBatchVault {
     // In-kind exit
     // ---------------------------------------------------------------------
 
-    /// @notice One in-kind exit: `shares` of `supply` (before the burn), paid to `receiver`,
-    /// IOUs owed to `owner` (the holder whose shares were burned).
-    struct Exit {
-        uint256 shares;
-        uint256 supply;
-        address receiver;
-        address owner;
-    }
-
-    /// @dev Per position and per inventory token: deliver the slice to `receiver`; if that
-    /// failed cheaply, take it into the vault and record an IOU for the owner; if even that
-    /// fails (or the first attempt burned its gas), leave it to the remaining holders.
-    /// Bookkeeping runs inside the gas-capped self-call frames and every credit is capped by
-    /// Uniswap's math, so a hostile token can only affect its own slice.
+    /// @dev Per position and per inventory token, VaultExit delivers the slice to
+    /// `receiver`, falls back to an IOU for the owner, or leaves it to the remaining holders
+    /// (see VaultExit.redeemInKind). Bookkeeping runs inside the gas-capped self-call frames
+    /// and every credit is capped by Uniswap's math, so a hostile token can only affect its
+    /// own slice.
     function _redeemPositionsInKind(uint256 shares, uint256 supply, address receiver) internal override {
         _checkReceiver(receiver);
         if (_exitBinding() != bytes32(0)) revert ExitInProgress();
         // AsyncBatchVault.redeemInKind burned the shares from msg.sender: IOUs go to them,
         // not to a receiver that may be unable to claim.
-        Exit memory x = Exit(shares, supply, receiver, msg.sender);
+        VaultExit.Exit memory x = VaultExit.Exit(shares, supply, receiver, msg.sender);
         EXIT_BINDING.asBytes32().tstore(keccak256(abi.encode(x)));
-        (uint256 n3, uint256 n4) = positionCount();
-        for (uint256 i = 0; i < n3 + n4; i++) {
-            VaultBook.Protocol protocol = i < n3 ? VaultBook.Protocol.V3 : VaultBook.Protocol.V4;
-            _exitPosition(protocol, positionAt(protocol, i < n3 ? i : i - n3), x);
-        }
-        uint256 nt = _book.tokens.length;
-        for (uint256 i = 0; i < nt; i++) {
-            _exitToken(_book.tokens[i], x);
-        }
+        VaultExit.redeemInKind(_book, x);
         EXIT_BINDING.asBytes32().tstore(bytes32(0));
-    }
-
-    function _exitPosition(VaultBook.Protocol protocol, uint256 tokenId, Exit memory x) private {
-        _requireGas(SLICE_GAS);
-        uint256 gasBefore = gasleft();
-        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, x, x.receiver) {
-            return;
-        } catch {}
-        if (gasBefore - gasleft() > SLICE_GAS * FALLBACK_MAX_BPS / BPS) {
-            emit SliceSkipped(protocol, tokenId);
-            return;
-        }
-        _requireGas(SLICE_GAS);
-        try this.exitSlice{gas: SLICE_GAS}(protocol, tokenId, x, address(this)) {}
-        catch {
-            emit SliceSkipped(protocol, tokenId);
-        }
-    }
-
-    /// @dev Inventory share: debited first; if the transfer fails it is owed instead (the
-    /// tokens never left, so the IOU is exact).
-    function _exitToken(address token, Exit memory x) private {
-        uint256 amount = Math.mulDiv(_book.tokenBalance[token], x.shares, x.supply);
-        if (amount == 0) return;
-        _book.tokenBalance[token] -= amount;
-        _requireGas(TOKEN_GAS);
-        try this.exitTransfer{gas: TOKEN_GAS}(token, amount, x) {}
-        catch {
-            VaultOps.recordOwed(_book, x.owner, token, amount);
-        }
     }
 
     /// @notice Self-call target of the in-kind exit: one position's slice. Bound to the
     /// exit in progress; pays the receiver or, as the fallback, the vault (recording an IOU
     /// for the owner).
-    function exitSlice(VaultBook.Protocol protocol, uint256 tokenId, Exit calldata x, address recipient)
-        external
-    {
+    function exitSlice(
+        VaultBook.Protocol protocol,
+        uint256 tokenId,
+        VaultExit.Exit calldata x,
+        address recipient
+    ) external {
         _requireBound(x);
         if (recipient != x.receiver && recipient != address(this)) revert UnboundSlice();
         _increaseIdle(
@@ -599,7 +535,7 @@ contract AbyssiaVault is AsyncBatchVault {
     }
 
     /// @notice Self-call target of the in-kind exit: one inventory token transfer.
-    function exitTransfer(address token, uint256 amount, Exit calldata x) external {
+    function exitTransfer(address token, uint256 amount, VaultExit.Exit calldata x) external {
         _requireBound(x);
         IERC20(token).safeTransfer(x.receiver, amount);
     }
@@ -623,18 +559,12 @@ contract AbyssiaVault is AsyncBatchVault {
         ) revert InvalidReceiver();
     }
 
-    function _requireBound(Exit calldata x) private view {
+    function _requireBound(VaultExit.Exit calldata x) private view {
         if (msg.sender != address(this)) revert OnlySelf();
         if (_exitBinding() != keccak256(abi.encode(x))) revert UnboundSlice();
     }
 
     function _exitBinding() private view returns (bytes32) {
         return EXIT_BINDING.asBytes32().tload();
-    }
-
-    /// @dev EIP-150: a CALL forwards at most 63/64 of the remaining gas. Revert rather than
-    /// let a capped call fail for lack of gas (which would silently skip a slice).
-    function _requireGas(uint256 budget) private view {
-        if (gasleft() < budget * 64 / 63 + GAS_RESERVE) revert InsufficientGas();
     }
 }
