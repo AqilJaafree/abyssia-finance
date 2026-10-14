@@ -118,9 +118,10 @@ contract AbyssiaVault is AsyncBatchVault {
     event PriceGuardsSet(int24 maxRebalanceTickDeviation, uint32 twapWindow, int24 maxTwapDeviation);
     event MinObservationsSet(uint16 value);
     event Rebalanced(
-        bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint256 entryValue
+        bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint160 entrySqrtPrice
     );
-    event StopLossTriggered(bytes32 indexed poolId, uint256 entryValue, uint256 value);
+    event StopLossTriggered(bytes32 indexed poolId, uint256 valueAtEntry, uint256 value);
+    event PoolUnwound(bytes32 indexed poolId);
     event TokenSurplusSwept(address indexed token, address indexed to, uint256 surplus);
     event ReferenceTickPosted(bytes32 indexed poolId, int24 tick);
     // Library events and errors, re-declared so indexers and clients can decode them from
@@ -228,20 +229,15 @@ contract AbyssiaVault is AsyncBatchVault {
     /// class's allowed shapes, max ranges, width bounds and cooldown apply; the pool's tick
     /// must be within maxRebalanceTickDeviation of `a.expectedTick` and, for v3, within
     /// maxTwapDeviation of its TWAP; afterwards the pool and its class must be within
-    /// their allocation limits. Records the pool's entry value for the stop-loss.
+    /// their allocation limits. Records the pool's price as the stop-loss basis.
     function rebalance(VaultRebalance.Args calldata a)
         external
         nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
     {
-        (uint256 usdcIn, uint256 usdcSpent, VaultOps.Exposure memory x) = VaultRebalance.rebalance(
-            _book,
-            _env(),
-            a,
-            VaultRebalance.Limits(maxRebalanceTickDeviation, twapWindow, maxTwapDeviation, minObservations),
-            idleAssets
-        );
+        (uint256 usdcIn, uint256 usdcSpent, VaultOps.Exposure memory x) =
+            VaultRebalance.rebalance(_book, _env(), a, _limits(), idleAssets);
         _increaseIdle(usdcIn);
         _decreaseIdle(usdcSpent);
         VaultBook.checkAllocation(_book, _env(), a.poolId, x.cls, x.params, totalAssets());
@@ -261,13 +257,22 @@ contract AbyssiaVault is AsyncBatchVault {
     }
 
     /// @notice Keeper or guardian: pull all liquidity out of `poolId` into the vault (no
-    /// swap), only if its positions are worth at least the class's stopLossBps less than
-    /// right after the last rebalance. Works while paused.
+    /// swap), only if its positions, valued at the pool's reference price, are worth at least
+    /// the class's stopLossBps less than at the price of its last rebalance (see
+    /// VaultRebalance.stopLoss). Works while paused. To read the current value and trigger,
+    /// simulate it: StopLossNotReached(value, trigger).
     function stopLoss(bytes32 poolId) external nonReentrant {
         if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(GUARDIAN_ROLE, msg.sender)) {
             revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
         }
-        _increaseIdle(VaultRebalance.stopLoss(_book, _env(), poolId));
+        _increaseIdle(VaultRebalance.stopLoss(_book, _env(), poolId, _limits()));
+    }
+
+    /// @notice Guardian: pull all liquidity out of `poolId` into the vault with no price
+    /// check (no swap either), e.g. when the pool's price reference is unavailable or the
+    /// stop-loss would trigger too late. Works while paused.
+    function emergencyUnwind(bytes32 poolId) external nonReentrant onlyRole(GUARDIAN_ROLE) {
+        _increaseIdle(VaultRebalance.unwind(_book, _env(), poolId));
     }
 
     /// @notice Remove `liquidity` from a position into the vault (v4 also harvests fees).
@@ -347,13 +352,8 @@ contract AbyssiaVault is AsyncBatchVault {
 
     /// @notice Claim tokens owed to you (the holder who exited in kind) because your
     /// receiver could not take them, to any address.
-    function claimOwed(address token, address to) external nonReentrant returns (uint256 amount) {
-        if (to == address(0) || to == address(this)) revert InvalidReceiver();
-        amount = _book.owed[msg.sender][token];
-        _book.owed[msg.sender][token] = 0;
-        _book.owedTotal[token] -= amount;
-        IERC20(token).safeTransfer(to, amount);
-        emit OwedClaimed(msg.sender, token, to, amount);
+    function claimOwed(address token, address to) external nonReentrant returns (uint256) {
+        return VaultOps.claimOwed(_book, token, to);
     }
 
     /// @notice Send out non-USDC tokens the vault holds beyond its books (donations, rounding
@@ -364,11 +364,7 @@ contract AbyssiaVault is AsyncBatchVault {
         onlyRole(DEFAULT_ADMIN_ROLE)
         returns (uint256 surplus)
     {
-        // Not USDC (sweepSurplus), and never the vault's own shares (escrowed requests).
-        if (token == usdcToken || token == address(this) || to == address(0)) revert ZeroAddress();
-        surplus = IERC20(token).balanceOf(address(this)) - _book.tokenBalance[token] - _book.owedTotal[token];
-        IERC20(token).safeTransfer(to, surplus);
-        emit TokenSurplusSwept(token, to, surplus);
+        return VaultOps.sweepTokenSurplus(_book, usdcToken, token, to);
     }
 
     // ---------------------------------------------------------------------
@@ -440,28 +436,14 @@ contract AbyssiaVault is AsyncBatchVault {
         return _book.positionPool[protocol][tokenId];
     }
 
-    /// @notice USDC value of one position's principal at its pool's current price.
-    function positionValue(VaultBook.Protocol protocol, uint256 tokenId) external view returns (uint256) {
-        return VaultBook.positionValue(_book, _env(), protocol, tokenId);
-    }
-
-    /// @notice USDC value of a pool's positions after its last rebalance (stop-loss basis),
-    /// when it was last rebalanced, and what its positions are worth now.
+    /// @notice A pool's stop-loss basis (its price at the last rebalance; 0 = none), when it
+    /// was last rebalanced, and (v4) its posted reference tick.
     function poolState(bytes32 poolId)
         external
         view
-        returns (uint256 entryValue, uint256 lastRebalance, uint256 currentValue)
+        returns (uint160 entrySqrtPrice, uint256 lastRebalance, VaultBook.ReferenceTick memory referenceTick)
     {
-        return (
-            _book.entryValue[poolId],
-            _book.lastRebalance[poolId],
-            VaultBook.poolPositionsValue(_book, _env(), poolId)
-        );
-    }
-
-    /// @notice A v4 pool's posted reference tick.
-    function referenceTick(bytes32 poolId) external view returns (VaultBook.ReferenceTick memory) {
-        return _book.referenceTick[poolId];
+        return (_book.entrySqrtPrice[poolId], _book.lastRebalance[poolId], _book.referenceTick[poolId]);
     }
 
     function inventoryTokens() external view returns (address[] memory) {
@@ -567,6 +549,10 @@ contract AbyssiaVault is AsyncBatchVault {
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
+
+    function _limits() private view returns (VaultRebalance.Limits memory) {
+        return VaultRebalance.Limits(maxRebalanceTickDeviation, twapWindow, maxTwapDeviation, minObservations);
+    }
 
     function _env() private view returns (VaultBook.Env memory) {
         return VaultBook.Env(registry, npm, posm, stateView, permit2, poolManager, swapRouter02, usdcToken);

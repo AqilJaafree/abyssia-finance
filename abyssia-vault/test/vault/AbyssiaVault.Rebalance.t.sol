@@ -85,10 +85,9 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         assertEq(n4, 5);
         assertApproxEqAbs(vault.idleAssets(), 8_000e6, 10);
         assertApproxEqAbs(vault.totalAssets(), nav, 10);
-        (uint256 entry, uint256 last, uint256 value) = vault.poolState(v4PoolId);
-        assertApproxEqAbs(entry, 1_000e6, 10); // rounding over 5 ranges
+        (uint160 entry, uint256 last,) = vault.poolState(v4PoolId);
+        assertEq(entry, TickMath.getSqrtPriceAtTick(0)); // the pool's price at the rebalance
         assertEq(last, block.timestamp);
-        assertEq(value, entry);
     }
 
     /// A second rebalance replaces the pool's ranges (old NFTs burned, value conserved).
@@ -327,10 +326,13 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         vm.expectPartialRevert(VaultRebalance.StopLossNotReached.selector);
         vault.stopLoss(v4PoolId);
 
-        // The token crashes: the ask's value falls by more than the class's 30%.
+        // The token crashes: the ask's value falls by more than the class's 30%, but the
+        // stop-loss values it at the reference tick, which has to follow first.
         _traderSwapV4(address(meme), 600_000e6);
-        (uint256 entry,, uint256 value) = vault.poolState(v4PoolId);
-        assertLt(value, entry * 7_000 / 10_000);
+        vm.prank(keeper);
+        vm.expectPartialRevert(VaultRebalance.StopLossNotReached.selector);
+        vault.stopLoss(v4PoolId);
+        _walkReference(v4PoolId, _tick(v4PoolId));
         uint256 memeBefore = vault.tokenBalance(address(meme));
         vm.prank(guardian);
         vault.stopLoss(v4PoolId);
@@ -338,7 +340,7 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         assertEq(n4, 0);
         // The liquidity is back in the vault as inventory (no forced swap).
         assertGt(vault.tokenBalance(address(meme)), memeBefore + got / 2);
-        (entry,,) = vault.poolState(v4PoolId);
+        (uint160 entry,,) = vault.poolState(v4PoolId);
         assertEq(entry, 0);
     }
 

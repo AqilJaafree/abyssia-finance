@@ -131,6 +131,10 @@ contract AbyssiaDeploySepoliaTest is Test {
 
         bytes32 v3Id = d.registry.poolIdAt(0);
         bytes32 v4Id = d.registry.poolIdAt(1);
+        // The guardian posts the v4 pool's first reference tick (its price now).
+        (, int24 start,,) = IStateView(script.network(block.chainid).stateView).getSlot0(v4Id);
+        vm.prank(guardian);
+        d.vault.postReferenceTick(v4Id, start);
         _rebalance(v4Id, Shapes.Spec(Shapes.BIDASK, Shapes.USDC_ONLY, 4, 600), 1e6);
         _rebalance(v3Id, Shapes.Spec(Shapes.SPOT, Shapes.USDC_ONLY, 2, 600), 5e5);
         (uint256 n3, uint256 n4) = d.vault.positionCount();

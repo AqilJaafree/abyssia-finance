@@ -299,7 +299,8 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
     /// per post, one post per twapWindow.
     function _walkReference(bytes32 poolId, int24 target) internal {
         int24 step = vault.maxTwapDeviation();
-        int24 ref = vault.referenceTick(poolId).tick;
+        (,, VaultBook.ReferenceTick memory r) = vault.poolState(poolId);
+        int24 ref = r.tick;
         while (ref != target) {
             vm.warp(block.timestamp + vault.twapWindow());
             if (target > ref) ref = target - ref > step ? ref + step : target;

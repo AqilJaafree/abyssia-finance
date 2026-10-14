@@ -109,6 +109,11 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
         vm.prank(alice);
         vault.claimDeposit(1, alice);
 
+        // The guardian posts the v4 pool's first reference tick (its price now).
+        (, int24 start,,) = IStateView(V4_STATE_VIEW).getSlot0(poolId);
+        vm.prank(guardian);
+        vault.postReferenceTick(poolId, start);
+
         vm.startPrank(keeper);
         uint256 got = vault.swap(poolId, true, 1_000e6, 950e6); // floor: 1:1 price minus 5%
         (, int24 tick,,) = IStateView(V4_STATE_VIEW).getSlot0(poolId);

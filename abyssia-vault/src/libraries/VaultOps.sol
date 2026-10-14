@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {VaultRegistry} from "../registry/VaultRegistry.sol";
 import {V3Positions} from "../v3/V3Positions.sol";
@@ -19,6 +20,8 @@ import {PoolPrice} from "./PoolPrice.sol";
 /// lying in `balanceOf` cannot over-credit, and a fee-on-transfer token credits what
 /// actually arrived.
 library VaultOps {
+    using SafeERC20 for IERC20;
+
     uint256 internal constant BPS = 10_000;
     /// @notice Hard cap on distinct non-USDC tokens held as inventory (see reserveToken).
     uint256 internal constant MAX_TOKENS = VaultBook.MAX_POSITIONS;
@@ -64,12 +67,16 @@ library VaultOps {
     );
     event PositionClosed(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event TokenOwed(address indexed owner, address indexed token, uint256 amount);
+    event OwedClaimed(address indexed receiver, address indexed token, address to, uint256 amount);
+    event TokenSurplusSwept(address indexed token, address indexed to, uint256 surplus);
 
     error InsufficientIdle(uint256 needed, uint256 available);
     error InsufficientInventory(address token, uint256 needed, uint256 available);
     error MinOutTooLow(uint256 minOut, uint256 floor);
     error TooManyTokens();
     error UnknownPosition(VaultBook.Protocol protocol, uint256 tokenId);
+    error InvalidReceiver();
+    error ZeroAddress();
 
     // ---------------------------------------------------------------------
     // Positions
@@ -322,6 +329,31 @@ library VaultOps {
         b.owed[owner][token] += amount;
         b.owedTotal[token] += amount;
         emit TokenOwed(owner, token, amount);
+    }
+
+    /// @notice Pay the caller's whole IOU in `token` to `to`.
+    function claimOwed(VaultBook.Book storage b, address token, address to)
+        external
+        returns (uint256 amount)
+    {
+        if (to == address(0) || to == address(this)) revert InvalidReceiver();
+        amount = b.owed[msg.sender][token];
+        b.owed[msg.sender][token] = 0;
+        b.owedTotal[token] -= amount;
+        IERC20(token).safeTransfer(to, amount);
+        emit OwedClaimed(msg.sender, token, to, amount);
+    }
+
+    /// @notice Send `to` the vault's `token` beyond its books: balance - inventory - IOUs.
+    /// Never USDC (see AsyncBatchVault.sweepSurplus) nor the vault's own shares.
+    function sweepTokenSurplus(VaultBook.Book storage b, address usdc, address token, address to)
+        external
+        returns (uint256 surplus)
+    {
+        if (token == usdc || token == address(this) || to == address(0)) revert ZeroAddress();
+        surplus = IERC20(token).balanceOf(address(this)) - b.tokenBalance[token] - b.owedTotal[token];
+        IERC20(token).safeTransfer(to, surplus);
+        emit TokenSurplusSwept(token, to, surplus);
     }
 
     // ---------------------------------------------------------------------

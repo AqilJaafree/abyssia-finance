@@ -7,6 +7,7 @@ import {V4Positions} from "../v4/V4Positions.sol";
 import {VaultBook} from "./VaultBook.sol";
 import {VaultOps} from "./VaultOps.sol";
 import {Shapes} from "./Shapes.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 /// @title VaultRebalance
 /// @notice Atomic per-pool rebalancing into a liquidity shape, and the verified stop-loss,
@@ -33,9 +34,10 @@ library VaultRebalance {
     }
 
     event Rebalanced(
-        bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint256 entryValue
+        bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint160 entrySqrtPrice
     );
-    event StopLossTriggered(bytes32 indexed poolId, uint256 entryValue, uint256 value);
+    event StopLossTriggered(bytes32 indexed poolId, uint256 valueAtEntry, uint256 value);
+    event PoolUnwound(bytes32 indexed poolId);
 
     error ShapeNotAllowed(uint8 shape);
     error CooldownActive(uint256 until);
@@ -94,29 +96,53 @@ library VaultRebalance {
             );
             usdcSpent += spent;
         }
-        uint256 entry = VaultBook.poolPositionsValue(b, e, a.poolId);
-        b.entryValue[a.poolId] = entry;
+        _recordEntry(b, e, a);
+    }
+
+    /// @dev The pool's price now becomes its stop-loss basis.
+    function _recordEntry(VaultBook.Book storage b, VaultBook.Env memory e, Args memory a) private {
+        uint160 entry = VaultBook.sqrtPrice(b.poolMeta[a.poolId], e.stateView, a.poolId);
+        b.entrySqrtPrice[a.poolId] = entry;
         b.lastRebalance[a.poolId] = block.timestamp;
         emit Rebalanced(a.poolId, a.spec.shape, a.spec.side, a.spec.ranges, a.spec.width, entry);
     }
 
     /// @notice Pull all liquidity out of `poolId` into the vault (no swap), but only if its
-    /// positions are worth at least the class's stopLossBps less than right after the last
-    /// rebalance.
+    /// positions, valued at the pool's reference price (v3: TWAP; v4: the posted reference
+    /// tick), are worth at least the class's stopLossBps less than the same positions valued
+    /// at the price of the last rebalance. Comparing the same liquidity at two prices makes
+    /// it a loss from the price move alone, unaffected by exits and withdrawals since, and
+    /// the reference price stops a pushed spot price from triggering it.
     /// @return usdcIn USDC the unwind returned (credit it to idle)
-    function stopLoss(VaultBook.Book storage b, VaultBook.Env memory e, bytes32 poolId)
+    function stopLoss(VaultBook.Book storage b, VaultBook.Env memory e, bytes32 poolId, Limits memory l)
         external
         returns (uint256 usdcIn)
     {
-        uint256 entry = b.entryValue[poolId];
+        uint160 entry = b.entrySqrtPrice[poolId];
         if (entry == 0) revert NoEntryValue(poolId);
-        uint256 value = VaultBook.poolPositionsValue(b, e, poolId);
+        VaultBook.PoolMeta memory m = b.poolMeta[poolId];
+        uint160 ref = TickMath.getSqrtPriceAtTick(
+            VaultBook.referenceTick(b, m, poolId, l.twapWindow, l.minObservations)
+        );
+        uint256 atEntry = VaultBook.poolPositionsValueAt(b, e, poolId, entry);
+        uint256 value = VaultBook.poolPositionsValueAt(b, e, poolId, ref);
         VaultRegistry.AssetClass cls = e.registry.getPool(poolId).assetClass;
-        uint256 trigger = entry * (BPS - e.registry.classParams(cls).stopLossBps) / BPS;
+        uint256 trigger = atEntry * (BPS - e.registry.classParams(cls).stopLossBps) / BPS;
         if (value > trigger) revert StopLossNotReached(value, trigger);
+        usdcIn = unwind(b, e, poolId);
+        emit StopLossTriggered(poolId, atEntry, value);
+    }
+
+    /// @notice Withdraw, harvest and burn every position the vault has in `poolId`, into
+    /// the vault (no swap, no price check), and clear its stop-loss basis.
+    /// @return usdcIn USDC the unwind returned (credit it to idle)
+    function unwind(VaultBook.Book storage b, VaultBook.Env memory e, bytes32 poolId)
+        public
+        returns (uint256 usdcIn)
+    {
         usdcIn = _unwind(b, e, poolId);
-        b.entryValue[poolId] = 0;
-        emit StopLossTriggered(poolId, entry, value);
+        b.entrySqrtPrice[poolId] = 0;
+        emit PoolUnwound(poolId);
     }
 
     /// @dev The pool's tick, after checking it against the keeper's expectation and the

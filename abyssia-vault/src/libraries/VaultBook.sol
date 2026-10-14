@@ -7,6 +7,7 @@ import {V4Positions} from "../v4/V4Positions.sol";
 import {PoolPrice} from "./PoolPrice.sol";
 import {PoolOracle} from "./PoolOracle.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {INonfungiblePositionManager as INPM} from "../interfaces/INonfungiblePositionManager.sol";
 import {IV4PositionManager} from "../interfaces/IV4PositionManager.sol";
 import {IStateView} from "../interfaces/IStateView.sol";
@@ -53,8 +54,8 @@ library VaultBook {
         address[] tokens;
         mapping(address receiver => mapping(address token => uint256)) owed;
         mapping(address token => uint256) owedTotal;
-        /// USDC value of a pool's positions right after its last rebalance (stop-loss basis).
-        mapping(bytes32 poolId => uint256) entryValue;
+        /// The pool's price at its last rebalance (stop-loss basis; 0 = none).
+        mapping(bytes32 poolId => uint160) entrySqrtPrice;
         mapping(bytes32 poolId => uint256) lastRebalance;
         /// v4 pools: the posted reference tick (v3 pools use their TWAP).
         mapping(bytes32 poolId => ReferenceTick) referenceTick;
@@ -300,19 +301,25 @@ library VaultBook {
         return PoolPrice.tokenToUsdc(amount, sqrtPrice(m, e.stateView, poolId), m.usdcIsToken0);
     }
 
-    /// @notice USDC value of all the vault's positions in `poolId` (principal, spot price).
-    function poolPositionsValue(Book storage b, Env memory e, bytes32 poolId)
+    /// @notice USDC value of the vault's positions in `poolId` (principal) if the pool's
+    /// price were `sqrtP`: the same liquidity valued at any price, so the stop-loss compares
+    /// like with like whatever exits or withdrawals have done to the positions.
+    function poolPositionsValueAt(Book storage b, Env memory e, bytes32 poolId, uint160 sqrtP)
         public
         view
         returns (uint256 v)
     {
+        PoolMeta memory m = b.poolMeta[poolId];
         uint256 n3 = V3Positions.count(b.v3);
         uint256 n = n3 + V4Positions.count(b.v4);
         for (uint256 i = 0; i < n; i++) {
             (Protocol protocol, uint256 id) = i < n3
                 ? (Protocol.V3, V3Positions.tokenIdAt(b.v3, i))
                 : (Protocol.V4, V4Positions.tokenIdAt(b.v4, i - n3));
-            if (b.positionPool[protocol][id] == poolId) v += positionValue(b, e, protocol, id);
+            if (b.positionPool[protocol][id] != poolId) continue;
+            (uint256 a0, uint256 a1) = _amountsAt(e, protocol, id, sqrtP);
+            (uint256 usdcAmt, uint256 tokenAmt) = m.usdcIsToken0 ? (a0, a1) : (a1, a0);
+            v += usdcAmt + PoolPrice.tokenToUsdc(tokenAmt, sqrtP, m.usdcIsToken0);
         }
     }
 
@@ -337,6 +344,38 @@ library VaultBook {
     // ---------------------------------------------------------------------
     // Internals
     // ---------------------------------------------------------------------
+
+    /// @dev A position's token amounts if its pool's price were `sqrtP` (rounded down).
+    function _amountsAt(Env memory e, Protocol protocol, uint256 id, uint160 sqrtP)
+        private
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        int24 lower;
+        int24 upper;
+        uint128 liquidity;
+        if (protocol == Protocol.V3) {
+            (,,,,, lower, upper, liquidity,,,,) = e.npm.positions(id);
+        } else {
+            liquidity = e.posm.getPositionLiquidity(id);
+            (, uint256 info) = e.posm.getPoolAndPositionInfo(id);
+            // PositionInfo: | poolId 200 | tickUpper 24 | tickLower 24 | hasSubscriber 8 |
+            assembly ("memory-safe") {
+                lower := signextend(2, shr(8, info))
+                upper := signextend(2, shr(32, info))
+            }
+        }
+        uint160 sqrtA = TickMath.getSqrtPriceAtTick(lower);
+        uint160 sqrtB = TickMath.getSqrtPriceAtTick(upper);
+        if (sqrtP <= sqrtA) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtA, sqrtB, liquidity, false);
+        } else if (sqrtP < sqrtB) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtP, sqrtB, liquidity, false);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtP, liquidity, false);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtB, liquidity, false);
+        }
+    }
 
     function _rangesIn(Book storage b, Protocol protocol, bytes32 poolId) private view returns (uint256 n) {
         uint256 count = protocol == Protocol.V3 ? V3Positions.count(b.v3) : V4Positions.count(b.v4);
