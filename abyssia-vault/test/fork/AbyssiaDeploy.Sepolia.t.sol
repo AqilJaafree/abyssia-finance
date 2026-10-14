@@ -14,6 +14,7 @@ import {Shapes} from "../../src/libraries/Shapes.sol";
 import {IStateView} from "../../src/interfaces/IStateView.sol";
 import {IUniswapV3Pool} from "../../src/interfaces/IUniswapV3Pool.sol";
 import {PoolKey, PoolKeyLib} from "../../src/types/PoolKey.sol";
+import {IPermit2} from "../../src/interfaces/IPermit2.sol";
 
 /// @dev The deployment scripts, then the vault end to end, on an Ethereum Sepolia fork:
 /// Uniswap's real v3 and v4, Circle's real USDC, and a real timelock handover. Skipped
@@ -35,6 +36,7 @@ contract AbyssiaDeploySepoliaTest is Test {
     address internal treasury = makeAddr("treasury");
     address internal proposer = makeAddr("proposer");
     bool internal forked;
+    SepoliaTestPools internal poolScript;
 
     function setUp() public {
         string memory url = vm.envOr("SEPOLIA_RPC_URL", string(""));
@@ -48,7 +50,7 @@ contract AbyssiaDeploySepoliaTest is Test {
         DeployAbyssia.Network memory n = script.network(block.chainid);
         usdc = IERC20(n.usdc);
 
-        SepoliaTestPools poolScript = new SepoliaTestPools();
+        poolScript = new SepoliaTestPools();
         vm.prank(DEPLOYER);
         usdc.transfer(address(poolScript), 4e6);
         pools = poolScript.deployPools(2e6, address(poolScript));
@@ -101,6 +103,20 @@ contract AbyssiaDeploySepoliaTest is Test {
         assertTrue(d.factory.isVault(address(d.vault)));
         assertEq(d.registry.poolCount(), 2);
         assertEq(address(d.vault.posm()), script.network(block.chainid).posm);
+    }
+
+    /// The test-pool script leaves no allowance behind, and TMEME has a fixed supply.
+    function test_testPoolsLeaveNoAllowances() public view {
+        DeployAbyssia.Network memory n = script.network(block.chainid);
+        address permit2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+        address[2] memory tokens = [address(usdc), pools.token];
+        for (uint256 i = 0; i < 2; i++) {
+            assertEq(IERC20(tokens[i]).allowance(address(poolScript), n.npm), 0);
+            assertEq(IERC20(tokens[i]).allowance(address(poolScript), permit2), 0);
+            (uint160 amount,,) = IPermit2(permit2).allowance(address(poolScript), tokens[i], n.posm);
+            assertEq(amount, 0);
+        }
+        assertEq(IERC20(pools.token).totalSupply(), 2 * 2e6 * 1e14);
     }
 
     /// Admin changes only go through the timelock, after the delay.

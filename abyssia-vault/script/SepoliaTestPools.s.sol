@@ -13,17 +13,10 @@ import {IV4PositionManager} from "../src/interfaces/IV4PositionManager.sol";
 import {IPermit2} from "../src/interfaces/IPermit2.sol";
 import {PoolKey} from "../src/types/PoolKey.sol";
 
-/// @dev Test memecoin for Sepolia: 18 decimals, its deployer mints.
+/// @dev Test memecoin for Sepolia: 18 decimals, a fixed supply minted once to `holder`.
 contract AbyssiaTestToken is ERC20 {
-    address public immutable minter;
-
-    constructor() ERC20("Abyssia Test Meme", "TMEME") {
-        minter = msg.sender;
-    }
-
-    function mint(address to, uint256 amount) external {
-        require(msg.sender == minter, "not minter");
-        _mint(to, amount);
+    constructor(address holder, uint256 supply) ERC20("Abyssia Test Meme", "TMEME") {
+        _mint(holder, supply);
     }
 }
 
@@ -89,12 +82,10 @@ contract SepoliaTestPools is Script {
 
     /// @notice Everything above; `actor` sends the calls and pays `seedUsdc` per pool.
     function deployPools(uint256 seedUsdc, address actor) public returns (Pools memory p) {
-        AbyssiaTestToken token = new AbyssiaTestToken();
-        p.token = address(token);
+        uint256 tokenSeed = seedUsdc * 1e14; // TMEME worth the USDC at 0.01 USDC each
+        p.token = address(new AbyssiaTestToken(actor, 2 * tokenSeed));
         bool usdcIs0 = USDC < p.token;
         uint160 sqrtP = TickMath.getSqrtPriceAtTick(usdcIs0 ? PRICE_TICK : -PRICE_TICK);
-        uint256 tokenSeed = seedUsdc * 1e14; // TMEME worth the USDC at 0.01 USDC each
-        token.mint(actor, 2 * tokenSeed);
         (address t0, address t1) = usdcIs0 ? (USDC, p.token) : (p.token, USDC);
         (uint256 a0, uint256 a1) = usdcIs0 ? (seedUsdc, tokenSeed) : (tokenSeed, seedUsdc);
 
@@ -104,10 +95,28 @@ contract SepoliaTestPools is Script {
         for (uint16 next = OBSERVATION_CHUNK; next <= OBSERVATIONS; next += OBSERVATION_CHUNK) {
             IUniswapV3Pool(p.v3Pool).increaseObservationCardinalityNext(next);
         }
+        // initialize and mint are separate transactions: the minimums stop a mint at a price
+        // someone moved in between (the v4 mint below is capped by its maximums instead).
         IERC20(t0).approve(NPM, a0);
         IERC20(t1).approve(NPM, a1);
         INPM(NPM)
-            .mint(INPM.MintParams(t0, t1, FEE, -FULL, FULL, a0, a1, 0, 0, actor, block.timestamp + 1 hours));
+            .mint(
+                INPM.MintParams(
+                    t0,
+                    t1,
+                    FEE,
+                    -FULL,
+                    FULL,
+                    a0,
+                    a1,
+                    a0 * 99 / 100,
+                    a1 * 99 / 100,
+                    actor,
+                    block.timestamp + 1 hours
+                )
+            );
+        IERC20(t0).approve(NPM, 0);
+        IERC20(t1).approve(NPM, 0);
 
         // v4: initialize a hookless pool, seed full range through Permit2.
         p.v4Key = PoolKey(t0, t1, FEE, SPACING, address(0));
@@ -127,5 +136,10 @@ contract SepoliaTestPools is Script {
             .modifyLiquidities(
                 abi.encode(abi.encodePacked(MINT_POSITION, SETTLE_PAIR), params), block.timestamp + 1 hours
             );
+        // No allowance is left behind.
+        IPermit2(PERMIT2).approve(t0, POSM, 0, 0);
+        IPermit2(PERMIT2).approve(t1, POSM, 0, 0);
+        IERC20(t0).approve(PERMIT2, 0);
+        IERC20(t1).approve(PERMIT2, 0);
     }
 }
