@@ -37,6 +37,7 @@ library VaultBook {
         address token;
         address v3Pool;
         uint24 fee;
+        int24 tickSpacing;
         PoolKey v4Key;
     }
 
@@ -50,6 +51,9 @@ library VaultBook {
         address[] tokens;
         mapping(address receiver => mapping(address token => uint256)) owed;
         mapping(address token => uint256) owedTotal;
+        /// USDC value of a pool's positions right after its last rebalance (stop-loss basis).
+        mapping(bytes32 poolId => uint256) entryValue;
+        mapping(bytes32 poolId => uint256) lastRebalance;
     }
 
     /// @dev The vault's fixed external dependencies.
@@ -89,6 +93,7 @@ library VaultBook {
             token: info.token,
             v3Pool: info.v3Pool,
             fee: info.fee,
+            tickSpacing: info.tickSpacing,
             v4Key: info.v4Key
         });
         b.poolMeta[poolId] = m;
@@ -210,6 +215,31 @@ library VaultBook {
         bytes32 poolId = b.tokenPool[token];
         PoolMeta memory m = b.poolMeta[poolId];
         return PoolPrice.tokenToUsdc(amount, sqrtPrice(m, e.stateView, poolId), m.usdcIsToken0);
+    }
+
+    /// @notice USDC value of all the vault's positions in `poolId` (principal, spot price).
+    function poolPositionsValue(Book storage b, Env memory e, bytes32 poolId)
+        public
+        view
+        returns (uint256 v)
+    {
+        uint256 n3 = V3Positions.count(b.v3);
+        uint256 n = n3 + V4Positions.count(b.v4);
+        for (uint256 i = 0; i < n; i++) {
+            (Protocol protocol, uint256 id) = i < n3
+                ? (Protocol.V3, V3Positions.tokenIdAt(b.v3, i))
+                : (Protocol.V4, V4Positions.tokenIdAt(b.v4, i - n3));
+            if (b.positionPool[protocol][id] == poolId) v += positionValue(b, e, protocol, id);
+        }
+    }
+
+    function currentTick(PoolMeta memory m, IStateView stateView, bytes32 poolId)
+        internal
+        view
+        returns (int24 tick)
+    {
+        if (m.protocol == Protocol.V3) (, tick,,,,,) = IUniswapV3Pool(m.v3Pool).slot0();
+        else (, tick,,) = stateView.getSlot0(poolId);
     }
 
     function sqrtPrice(PoolMeta memory m, IStateView stateView, bytes32 poolId)

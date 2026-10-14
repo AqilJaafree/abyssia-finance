@@ -19,4 +19,10 @@ contract MockV3Pool is IUniswapV3Pool {
     function liquidity() external pure returns (uint128) {
         return 0;
     }
+
+    function observe(uint32[] calldata) external pure returns (int56[] memory, uint160[] memory) {
+        return (new int56[](2), new uint160[](2));
+    }
+
+    function increaseObservationCardinalityNext(uint16) external {}
 }

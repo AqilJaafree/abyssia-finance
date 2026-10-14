@@ -12,6 +12,7 @@ import {V4Positions} from "./v4/V4Positions.sol";
 import {VaultSwaps} from "./libraries/VaultSwaps.sol";
 import {VaultBook} from "./libraries/VaultBook.sol";
 import {VaultOps} from "./libraries/VaultOps.sol";
+import {VaultRebalance} from "./libraries/VaultRebalance.sol";
 import {INonfungiblePositionManager as INPM} from "./interfaces/INonfungiblePositionManager.sol";
 import {IV4PositionManager} from "./interfaces/IV4PositionManager.sol";
 import {IV4PoolManager} from "./interfaces/IV4PoolManager.sol";
@@ -22,22 +23,23 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// @title AbyssiaVault
 /// @notice USDC vault that provides Uniswap v3 and v4 liquidity to registry-allowlisted
 /// USDC pools. Deposits/redemptions settle in batches (AsyncBatchVault); an in-kind exit
-/// is always available. The keeper opens, withdraws and closes positions, collects fees
-/// and swaps between USDC and a pool's token, always within the registry's class limits,
-/// only in hookless v4 pools, and never sending assets anywhere but the vault.
-/// TRUST: the keeper is trusted within these bounds, not beyond them. Spot-price checks
-/// bound price impact, not manipulation: a compromised keeper colluding with someone who
-/// moves a pool's price can open, withdraw or swap at that price (up to the pool's
-/// allocation), and the keeper picks the expected price each settlement is checked against.
-/// Run the keeper with private transaction submission and off-chain fair prices (its
-/// expected settlement price must come from those, never from this vault's own
-/// `sharePrice()` read just before settling, which would undo the protection); a later
-/// plan adds TWAP bounds and a minimum interval between settlements.
+/// is always available. The keeper rebalances pools into liquidity shapes, withdraws and
+/// closes positions, collects fees and swaps between USDC and a pool's token, always within
+/// the registry's class limits, only in hookless v4 pools, and never sending assets
+/// anywhere but the vault. The keeper or guardian can trigger a verified stop-loss.
+/// TRUST: the keeper is trusted within these bounds, not beyond them. Price guards (the
+/// rebalance tick band, v3 TWAP checks, the swap floor) bound how far a pool's price can be
+/// pushed around a keeper action, but within them a compromised keeper colluding with
+/// someone who moves a price can still trade at that price (up to the pool's allocation),
+/// and the keeper picks the expected price each settlement is checked against. Hookless v4
+/// pools have no TWAP. Run the keeper with private transaction submission and off-chain
+/// fair prices (its expected settlement price must come from those, never from this vault's
+/// own `sharePrice()` read just before settling, which would undo the protection).
 /// @dev Accounting never takes token balances as truth: idle USDC (`idleAssets`) and token
 /// inventory (`tokenBalance`) are tracked internally, and every credit is the smaller of
 /// the balance delta and the amount Uniswap's own math reports. The book, its checks and
-/// the operations live in the VaultBook / VaultOps libraries; this contract owns idle
-/// USDC, access control and the in-kind exit's gas and fallback logic.
+/// the operations live in the VaultBook / VaultOps / VaultRebalance libraries; this
+/// contract owns idle USDC, access control and the in-kind exit's gas and fallback logic.
 contract AbyssiaVault is AsyncBatchVault {
     using SafeERC20 for IERC20;
     using TransientSlot for bytes32;
@@ -52,6 +54,15 @@ contract AbyssiaVault is AsyncBatchVault {
     uint256 public constant MAX_TOKENS = VaultOps.MAX_TOKENS;
     /// @notice Hard cap on the keeper's swap slippage bound (vs the pool's price).
     uint256 public constant MAX_SWAP_SLIPPAGE_BPS_CAP = 1_000;
+    /// @notice Hard cap on how far (ticks) a pool's tick may be from the keeper's expected
+    /// tick when rebalancing (1 tick ~ 0.01%).
+    int24 public constant MAX_REBALANCE_TICK_DEVIATION_CAP = 500;
+    /// @notice Hard cap on how far a v3 pool's tick may be from its TWAP for keeper swaps
+    /// and rebalances.
+    int24 public constant MAX_TWAP_DEVIATION_CAP = 2_000;
+    /// @notice Bounds of the v3 TWAP window.
+    uint32 public constant MIN_TWAP_WINDOW = 60;
+    uint32 public constant MAX_TWAP_WINDOW = 1 hours;
     /// @notice Gas budget of ONE in-kind slice attempt (a normal slice uses ~170-200k).
     uint256 public constant SLICE_GAS = 500_000;
     /// @notice Gas budget of ONE inventory-token transfer in an in-kind exit.
@@ -99,11 +110,19 @@ contract AbyssiaVault is AsyncBatchVault {
 
     VaultBook.Book internal _book;
     uint256 public maxSwapSlippageBps;
+    int24 public maxRebalanceTickDeviation = 100;
+    uint32 public twapWindow = 10 minutes;
+    int24 public maxTwapDeviation = 500;
 
     event SliceSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event HarvestSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event OwedClaimed(address indexed receiver, address indexed token, address to, uint256 amount);
     event MaxSwapSlippageBpsSet(uint256 value);
+    event PriceGuardsSet(int24 maxRebalanceTickDeviation, uint32 twapWindow, int24 maxTwapDeviation);
+    event Rebalanced(
+        bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint256 entryValue
+    );
+    event StopLossTriggered(bytes32 indexed poolId, uint256 entryValue, uint256 value);
     event TokenSurplusSwept(address indexed token, address indexed to, uint256 surplus);
     // Library events and errors, re-declared so indexers and clients can decode them from
     // the vault's ABI.
@@ -153,6 +172,18 @@ contract AbyssiaVault is AsyncBatchVault {
     error ZeroLiquidity();
     error InsufficientOutput(uint256 out, uint256 minOut);
     error UnexpectedCallback();
+    error ShapeNotAllowed(uint8 shape);
+    error CooldownActive(uint256 until);
+    error TickNotAsExpected(int24 tick, int24 expectedTick);
+    error NoEntryValue(bytes32 poolId);
+    error StopLossNotReached(uint256 value, uint256 trigger);
+    error TwapUnavailable(address pool, uint32 window);
+    error PriceOffTwap(int24 tick, int24 twapTick);
+    error InvalidShape();
+    error InvalidSide();
+    error InvalidRangeCount();
+    error InvalidWidth();
+    error OutOfTickBounds();
 
     constructor(Config memory c)
         AsyncBatchVault(
@@ -187,20 +218,39 @@ contract AbyssiaVault is AsyncBatchVault {
     // Keeper
     // ---------------------------------------------------------------------
 
-    /// @notice Open one range position in a registry-usable, hookless pool from idle USDC
-    /// and token inventory, within the pool's class limits.
-    function openPosition(VaultOps.OpenArgs calldata p)
+    /// @notice Rebalance one pool into a liquidity shape: withdraw every range the vault has
+    /// there, then open `a.spec` (N ranges, Spot / Curve / Bid-Ask, on both sides of the
+    /// price, a USDC-only bid or a token-only ask) from idle USDC and token inventory. The
+    /// class's allowed shapes, max ranges, width bounds and cooldown apply; the pool's tick
+    /// must be within maxRebalanceTickDeviation of `a.expectedTick` and, for v3, within
+    /// maxTwapDeviation of its TWAP; afterwards the pool and its class must be within
+    /// their allocation limits. Records the pool's entry value for the stop-loss.
+    function rebalance(VaultRebalance.Args calldata a)
         external
         nonReentrant
         whenNotPaused
         onlyRole(KEEPER_ROLE)
-        returns (uint256 tokenId)
     {
-        uint256 usdcSpent;
-        VaultOps.Exposure memory x;
-        (tokenId, usdcSpent, x) = VaultOps.open(_book, _env(), p, idleAssets);
+        (uint256 usdcIn, uint256 usdcSpent, VaultOps.Exposure memory x) = VaultRebalance.rebalance(
+            _book,
+            _env(),
+            a,
+            VaultRebalance.Limits(maxRebalanceTickDeviation, twapWindow, maxTwapDeviation),
+            idleAssets
+        );
+        _increaseIdle(usdcIn);
         _decreaseIdle(usdcSpent);
-        VaultBook.checkAllocation(_book, _env(), p.poolId, x.cls, x.params, totalAssets());
+        VaultBook.checkAllocation(_book, _env(), a.poolId, x.cls, x.params, totalAssets());
+    }
+
+    /// @notice Keeper or guardian: pull all liquidity out of `poolId` into the vault (no
+    /// swap), only if its positions are worth at least the class's stopLossBps less than
+    /// right after the last rebalance. Works while paused.
+    function stopLoss(bytes32 poolId) external nonReentrant {
+        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(GUARDIAN_ROLE, msg.sender)) {
+            revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
+        }
+        _increaseIdle(VaultRebalance.stopLoss(_book, _env(), poolId));
     }
 
     /// @notice Remove `liquidity` from a position into the vault (v4 also harvests fees).
@@ -246,7 +296,12 @@ contract AbyssiaVault is AsyncBatchVault {
         uint256 paid;
         VaultOps.Exposure memory x;
         (paid, out, x) = VaultOps.swap(
-            _book, _env(), VaultOps.SwapArgs(poolId, usdcIn, amountIn, minOut, maxSwapSlippageBps), idleAssets
+            _book,
+            _env(),
+            VaultOps.SwapArgs(
+                poolId, usdcIn, amountIn, minOut, maxSwapSlippageBps, twapWindow, maxTwapDeviation
+            ),
+            idleAssets
         );
         if (usdcIn) {
             _decreaseIdle(paid);
@@ -306,6 +361,29 @@ contract AbyssiaVault is AsyncBatchVault {
         _setMaxSwapSlippageBps(value);
     }
 
+    /// @notice Admin: the rebalance tick band and the v3 TWAP guard (window and deviation).
+    function setPriceGuards(int24 tickDeviation, uint32 window, int24 twapDeviation)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (
+            tickDeviation <= 0 || tickDeviation > MAX_REBALANCE_TICK_DEVIATION_CAP || window < MIN_TWAP_WINDOW
+                || window > MAX_TWAP_WINDOW || twapDeviation <= 0 || twapDeviation > MAX_TWAP_DEVIATION_CAP
+        ) revert ParamOutOfBounds();
+        (maxRebalanceTickDeviation, twapWindow, maxTwapDeviation) = (tickDeviation, window, twapDeviation);
+        emit PriceGuardsSet(tickDeviation, window, twapDeviation);
+    }
+
+    /// @notice Guardian may only narrow the tick band and the TWAP deviation, instantly.
+    function tightenPriceGuards(int24 tickDeviation, int24 twapDeviation) external onlyRole(GUARDIAN_ROLE) {
+        if (
+            tickDeviation <= 0 || tickDeviation > maxRebalanceTickDeviation || twapDeviation <= 0
+                || twapDeviation > maxTwapDeviation
+        ) revert NotLower();
+        (maxRebalanceTickDeviation, maxTwapDeviation) = (tickDeviation, twapDeviation);
+        emit PriceGuardsSet(tickDeviation, twapWindow, twapDeviation);
+    }
+
     function _setMaxSwapSlippageBps(uint256 value) private {
         if (value > MAX_SWAP_SLIPPAGE_BPS_CAP) revert ParamOutOfBounds();
         maxSwapSlippageBps = value;
@@ -334,6 +412,20 @@ contract AbyssiaVault is AsyncBatchVault {
     /// @notice USDC value of one position's principal at its pool's current price.
     function positionValue(VaultBook.Protocol protocol, uint256 tokenId) external view returns (uint256) {
         return VaultBook.positionValue(_book, _env(), protocol, tokenId);
+    }
+
+    /// @notice USDC value of a pool's positions after its last rebalance (stop-loss basis),
+    /// when it was last rebalanced, and what its positions are worth now.
+    function poolState(bytes32 poolId)
+        external
+        view
+        returns (uint256 entryValue, uint256 lastRebalance, uint256 currentValue)
+    {
+        return (
+            _book.entryValue[poolId],
+            _book.lastRebalance[poolId],
+            VaultBook.poolPositionsValue(_book, _env(), poolId)
+        );
     }
 
     function inventoryTokens() external view returns (address[] memory) {

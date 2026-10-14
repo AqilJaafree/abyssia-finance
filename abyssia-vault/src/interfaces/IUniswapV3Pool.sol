@@ -17,4 +17,11 @@ interface IUniswapV3Pool {
         );
 
     function liquidity() external view returns (uint128);
+
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+
+    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external;
 }
