@@ -298,7 +298,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         external
         onlyRole(GUARDIAN_ROLE)
     {
-        if (expectedPrice == 0 || toleranceBps > maxCycleMoveBps) revert ParamOutOfBounds();
+        if (expectedPrice == 0 || toleranceBps > maxCycleMoveBps || toleranceBps > MAX_SETTLE_TOLERANCE_BPS) {
+            revert ParamOutOfBounds();
+        }
         _settle(true, expectedPrice, toleranceBps);
     }
 

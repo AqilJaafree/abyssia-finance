@@ -29,7 +29,9 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// bound price impact, not manipulation: a compromised keeper colluding with someone who
 /// moves a pool's price can open, withdraw or swap at that price (up to the pool's
 /// allocation), and the keeper picks the expected price each settlement is checked against.
-/// Run the keeper with private transaction submission and off-chain fair prices; a later
+/// Run the keeper with private transaction submission and off-chain fair prices (its
+/// expected settlement price must come from those, never from this vault's own
+/// `sharePrice()` read just before settling, which would undo the protection); a later
 /// plan adds TWAP bounds and a minimum interval between settlements.
 /// @dev Accounting never takes token balances as truth: idle USDC (`idleAssets`) and token
 /// inventory (`tokenBalance`) are tracked internally, and every credit is the smaller of
@@ -283,7 +285,8 @@ contract AbyssiaVault is AsyncBatchVault {
         onlyRole(DEFAULT_ADMIN_ROLE)
         returns (uint256 surplus)
     {
-        if (token == usdcToken || to == address(0)) revert ZeroAddress();
+        // Not USDC (sweepSurplus), and never the vault's own shares (escrowed requests).
+        if (token == usdcToken || token == address(this) || to == address(0)) revert ZeroAddress();
         surplus = IERC20(token).balanceOf(address(this)) - _book.tokenBalance[token] - _book.owedTotal[token];
         IERC20(token).safeTransfer(to, surplus);
         emit TokenSurplusSwept(token, to, surplus);

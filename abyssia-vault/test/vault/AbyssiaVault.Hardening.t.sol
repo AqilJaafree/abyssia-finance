@@ -199,9 +199,29 @@ contract AbyssiaVaultHardeningTest is AbyssiaVaultTestBase {
         vm.prank(admin);
         assertEq(vault.sweepTokenSurplus(address(meme), admin), 5e18);
         assertEq(meme.balanceOf(address(vault)), got);
-        vm.prank(admin);
+        vm.startPrank(admin);
         vm.expectRevert(AsyncBatchVault.ZeroAddress.selector);
         vault.sweepTokenSurplus(address(usdc), admin);
+        vm.stopPrank();
+    }
+
+    /// The vault's own shares (escrowed redeem requests, unclaimed deposits) are never surplus.
+    function test_sweepTokenSurplusCannotTakeEscrowedShares() public {
+        _requestDeposit(bob, 1_000e6);
+        _settle(); // bob's shares now sit in the vault until claimed
+        assertGt(vault.balanceOf(address(vault)), 0);
+        vm.prank(admin);
+        vm.expectRevert(AsyncBatchVault.ZeroAddress.selector);
+        vault.sweepTokenSurplus(address(vault), admin);
+    }
+
+    /// The guardian override can't accept a wide band either.
+    function test_guardianOverrideToleranceIsCapped() public {
+        uint256 cap = vault.MAX_SETTLE_TOLERANCE_BPS();
+        uint256 price = vault.sharePrice();
+        vm.prank(guardian);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.settleAcceptingPriceMove(price, cap + 1);
     }
 
     function _usdcSide() internal view returns (int24 lo, int24 hi) {
