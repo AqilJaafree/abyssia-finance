@@ -7,6 +7,7 @@ import {AsyncBatchVaultHarness} from "./harness/AsyncBatchVaultHarness.sol";
 
 contract AsyncBatchVaultFeesTest is VaultTestBase {
     address internal treasury = makeAddr("treasury");
+    uint256 internal constant PERIOD = 7 days;
 
     function setUp() public override {
         super.setUp();
@@ -20,6 +21,7 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         AsyncBatchVaultHarness fresh = new AsyncBatchVaultHarness(usdc, admin, keeper, guardian);
         assertEq(fresh.performanceFeeBps(), 1_500);
         assertEq(fresh.managementFeeBps(), 0);
+        assertEq(fresh.feePeriod(), PERIOD);
         assertEq(fresh.highWaterMark(), 0);
         assertEq(fresh.treasury(), admin);
     }
@@ -27,32 +29,68 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
     function test_firstSettlementOnlySetsTheHighWaterMark() public {
         _depositAndClaim(alice, 100 * USDC);
         assertEq(vault.highWaterMark(), 1e6);
+        assertEq(vault.feePeriodStart(), block.timestamp);
         assertEq(vault.balanceOf(treasury), 0);
     }
 
-    /// +10% NAV: the treasury's new shares are worth 15% of the gain, holders keep 85%.
-    function test_performanceFeeOnGainAboveHighWaterMark() public {
+    /// A gain is not charged mid-period; at the first settlement after the period ends the
+    /// treasury's new shares are worth 15% of it and holders keep 85%.
+    function test_performanceFeeOnlyWhenThePeriodEnds() public {
         _depositAndClaim(alice, 100 * USDC);
         _gain(10 * USDC);
         _settle();
+        assertEq(vault.balanceOf(treasury), 0);
+        assertApproxEqAbs(vault.feePeriodLow(), 1.1e6, 1);
+        _settleAfterPeriod();
         uint256 treasuryValue = vault.convertToAssets(vault.balanceOf(treasury));
         assertApproxEqRel(treasuryValue, 1.5e6, 0.0001e18); // 15% of 10 USDC (virtual-share rounding)
         assertApproxEqRel(vault.convertToAssets(vault.balanceOf(alice)), 108.5e6, 0.0001e18);
         assertApproxEqAbs(vault.highWaterMark(), 1.085e6, 1);
         assertEq(vault.lastSharePrice(), vault.highWaterMark());
+        assertEq(vault.feePeriodLow(), 0); // a new period started
     }
 
-    /// No fee is charged on recovering losses: only gains above the previous peak.
+    /// M-2: a spike that does not hold through the period is never charged.
+    function test_spikeWithinThePeriodIsNotCharged() public {
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(10 * USDC);
+        _settle(); // 1.10
+        vault.harnessDecreaseIdle(10 * USDC);
+        _settle(); // back to 1.00: the period's low
+        _gain(10 * USDC);
+        _settleAfterPeriod(); // 1.10 at the close, but the low was 1.00
+        assertEq(vault.balanceOf(treasury), 0);
+        assertEq(vault.highWaterMark(), 1e6);
+    }
+
+    /// The fee is on the period's low, not its close; the rest of the gain is charged in a
+    /// later period only if it holds through that one too.
+    function test_gainAboveThePeriodLowCarriesToTheNextPeriod() public {
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(10 * USDC);
+        _settle(); // 1.10: the low
+        _gain(10 * USDC);
+        _settleAfterPeriod(); // 1.20 at the close: charged on 1.00 -> 1.10 only
+        assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 1.5e6, 0.0001e18);
+        assertApproxEqAbs(vault.highWaterMark(), 1.085e6, 1); // 1.10 less the 0.015 fee per share
+        _settle(); // 1.185, held
+        _settleAfterPeriod();
+        // Now the remaining 0.10 per share is charged too: 1.5 USDC more.
+        assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 3e6, 0.001e18);
+    }
+
+    /// No fee is charged on recovering losses: only gains above the previous mark.
     function test_noPerformanceFeeBelowHighWaterMark() public {
         _depositAndClaim(alice, 100 * USDC);
         _gain(10 * USDC);
-        _settle(); // peak 1.085
+        _settle();
+        _settleAfterPeriod(); // mark 1.085
         uint256 tBefore = vault.balanceOf(treasury);
-        // Drop 5%, then recover 4%: still below the peak.
+        // Drop 5%, then recover 4%: still below the mark at the next close.
         vault.harnessDecreaseIdle(5 * USDC);
         _settle();
         _gain(4 * USDC);
-        _settle();
+        _settleAfterPeriod();
         assertEq(vault.balanceOf(treasury), tBefore);
     }
 
@@ -66,6 +104,65 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         uint256 treasuryValue = vault.convertToAssets(vault.balanceOf(treasury));
         assertApproxEqRel(treasuryValue, 2e6, 0.001e18);
         assertApproxEqRel(vault.totalAssets(), 100e6, 0.000001e18); // fees are dilution, not outflow
+    }
+
+    /// L-1: a rate change accrues the fee owed so far at the old rate; the new rate applies
+    /// only from the change.
+    function test_managementRateChangeIsNotRetroactive() public {
+        vm.prank(admin);
+        vault.setFees(0, 200);
+        _depositAndClaim(alice, 100 * USDC);
+        vm.warp(block.timestamp + 365 days);
+        vm.prank(guardian);
+        vault.lowerFees(0, 0); // a year at 2% is accrued now
+        assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 2e6, 0.001e18);
+        assertEq(vault.lastFeeAccrual(), block.timestamp);
+        uint256 tBefore = vault.balanceOf(treasury);
+        vm.warp(block.timestamp + 365 days);
+        _settle();
+        assertEq(vault.balanceOf(treasury), tBefore); // nothing at the new 0% rate
+    }
+
+    /// previewSettlePrice matches what settlement checks and converts at: mid-period (the
+    /// management fee only) and at a period close (the performance fee too).
+    function test_previewSettlePrice() public {
+        vm.prank(admin);
+        vault.setFees(1_500, 200);
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(10 * USDC);
+        vm.warp(block.timestamp + 1 days);
+        (uint256 pre, uint256 post) = vault.previewSettlePrice();
+        assertEq(pre, vault.sharePrice());
+        assertLt(post, pre); // management fee only
+        vm.prank(keeper);
+        vault.settle(pre);
+        assertEq(vault.lastSharePrice(), post);
+
+        vm.warp(block.timestamp + PERIOD);
+        (pre, post) = vault.previewSettlePrice();
+        vm.prank(keeper);
+        vault.settle(pre);
+        assertEq(vault.lastSharePrice(), post);
+        assertGt(vault.balanceOf(treasury), 0);
+    }
+
+    function test_previewBeforeTheFirstSettlement() public view {
+        (uint256 pre, uint256 post) = vault.previewSettlePrice();
+        assertEq(pre, post);
+    }
+
+    function test_feePeriodBoundsAndAuth() public {
+        vm.startPrank(admin);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setFeePeriod(1 days - 1);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setFeePeriod(90 days + 1);
+        vault.setFeePeriod(30 days);
+        vm.stopPrank();
+        assertEq(vault.feePeriod(), 30 days);
+        _expectUnauthorized(guardian, vault.DEFAULT_ADMIN_ROLE());
+        vm.prank(guardian);
+        vault.setFeePeriod(1 days);
     }
 
     function test_feeAdminCapsAndGuardianLowering() public {
@@ -99,11 +196,12 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
     }
 
     /// Once a vault empties, the next holders' fee basis is the current price, not the old
-    /// peak.
+    /// mark, and a new period starts.
     function test_highWaterMarkResetsWhenTheVaultEmpties() public {
         uint256 shares = _depositAndClaim(alice, 100 * USDC);
         _gain(15 * USDC); // within the 20% cycle guard
-        _settle(); // peak ~1.1275
+        _settle();
+        _settleAfterPeriod(); // mark ~1.1275
         vm.prank(alice);
         vault.redeemInKind(shares, alice);
         uint256 rest = vault.balanceOf(treasury);
@@ -112,8 +210,15 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         assertEq(vault.totalSupply(), 0);
         _depositAndClaim(bob, 100 * USDC); // settles on an empty vault
         assertEq(vault.highWaterMark(), vault.lastSharePrice());
+        assertEq(vault.feePeriodStart(), block.timestamp);
         _gain(10 * USDC);
         _settle();
+        _settleAfterPeriod();
         assertGt(vault.balanceOf(treasury), 0); // the new gain is charged
+    }
+
+    function _settleAfterPeriod() internal {
+        vm.warp(vault.feePeriodStart() + vault.feePeriod());
+        _settle();
     }
 }
