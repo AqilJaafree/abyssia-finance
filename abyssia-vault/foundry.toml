@@ -19,6 +19,7 @@ compilation_restrictions = [
     { paths = "src/libraries/VaultOps.sol", via_ir = true },
     { paths = "src/libraries/Shapes.sol", via_ir = true },
     { paths = "src/libraries/VaultRebalance.sol", via_ir = true },
+    { paths = "script/SepoliaTestPools.s.sol", via_ir = true },
 ]
 # Tests and the testnet deploy script read Uniswap's official v3 build artifacts
 # (v3 is not deployed on Arc testnet), and the official v4 build artifacts to deploy
