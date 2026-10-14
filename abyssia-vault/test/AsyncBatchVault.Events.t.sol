@@ -18,7 +18,7 @@ contract AsyncBatchVaultEventsTest is VaultTestBase {
     function test_cancelDepositEmits() public {
         _requestDeposit(alice, 100 * USDC);
         vm.expectEmit(true, true, false, true, address(vault));
-        emit AsyncBatchVault.DepositRequestCancelled(alice, 1, 100 * USDC);
+        emit AsyncBatchVault.DepositRequestCancelled(alice, 1, alice, alice, 100 * USDC);
         vm.prank(alice);
         vault.cancelDepositRequest();
     }
@@ -36,7 +36,7 @@ contract AsyncBatchVaultEventsTest is VaultTestBase {
         vm.startPrank(alice);
         vault.requestRedeem(shares);
         vm.expectEmit(true, true, false, true, address(vault));
-        emit AsyncBatchVault.RedeemRequestCancelled(alice, 2, shares);
+        emit AsyncBatchVault.RedeemRequestCancelled(alice, 2, alice, alice, shares);
         vault.cancelRedeemRequest();
         vm.stopPrank();
     }

@@ -41,6 +41,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @dev Bounds of the performance-fee period.
     uint256 public constant MIN_FEE_PERIOD = 1 days;
     uint256 public constant MAX_FEE_PERIOD = 90 days;
+    /// @dev How long a batch lock lasts at most, and how long a batch must have been open
+    /// before the keeper may lock it.
+    uint256 public constant BATCH_LOCK = 15 minutes;
     uint256 internal constant YEAR = 365 days;
 
     struct Batch {
@@ -97,14 +100,32 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public feePeriodLow;
     /// @notice When fees were last accrued (0 before the first settlement).
     uint256 public lastFeeAccrual;
+    /// @notice Until then, the open batch is locked: no redeem requests and no
+    /// cancellations, so the batch the keeper sized its idle USDC for is the one it settles.
+    uint256 public batchLockedUntil;
+    /// @notice The last batch the keeper locked (each batch can be locked once).
+    uint256 public lastLockedBatch;
     /// @notice ERC-7540 operators: `operator` may cancel and claim on behalf of `controller`
     /// (and choose the receiver), so approving one is full trust over those requests.
     mapping(address controller => mapping(address operator => bool)) public isOperator;
 
     event DepositRequested(address indexed user, uint256 indexed batchId, uint256 assets);
-    event DepositRequestCancelled(address indexed user, uint256 indexed batchId, uint256 assets);
+    event DepositRequestCancelled(
+        address indexed controller,
+        uint256 indexed batchId,
+        address operator,
+        address receiver,
+        uint256 assets
+    );
     event RedeemRequested(address indexed user, uint256 indexed batchId, uint256 shares);
-    event RedeemRequestCancelled(address indexed user, uint256 indexed batchId, uint256 shares);
+    event RedeemRequestCancelled(
+        address indexed controller,
+        uint256 indexed batchId,
+        address operator,
+        address receiver,
+        uint256 shares
+    );
+    event BatchLocked(uint256 indexed batchId, uint256 until);
     event BatchSettled(
         uint256 indexed batchId,
         uint256 sharePrice,
@@ -147,6 +168,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     error NotOperator(address controller, address caller);
     error InvalidOperator();
     error SettledTooRecently(uint256 nextAllowed);
+    error BatchIsLocked(uint256 until);
+    error CannotLock();
 
     constructor(
         IERC20 asset_,
@@ -257,8 +280,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         emit DepositRequested(msg.sender, id, assets);
     }
 
-    /// @notice Withdraw your whole deposit request from the open (unsettled) batch.
-    /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
+    /// @notice Withdraw your whole deposit request from the open (unsettled) batch. Not
+    /// while the batch is locked (see lockBatch).
     function cancelDepositRequest() external nonReentrant {
         _cancelDeposit(msg.sender, msg.sender);
     }
@@ -271,6 +294,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
     function _cancelDeposit(address controller, address receiver) private {
         _checkUsdcReceiver(receiver);
+        _requireUnlocked();
         uint256 id = currentBatchId;
         uint256 assets = depositRequestOf[id][controller];
         if (assets == 0) revert NothingToCancel();
@@ -278,11 +302,12 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         batches[id].depositAssets -= assets.toUint128();
         pendingDepositAssets -= assets;
         IERC20(asset()).safeTransfer(receiver, assets);
-        emit DepositRequestCancelled(controller, id, assets);
+        emit DepositRequestCancelled(controller, id, msg.sender, receiver, assets);
     }
 
     function requestRedeem(uint256 shares) external nonReentrant whenNotPaused {
         if (shares == 0) revert ZeroAmount();
+        _requireUnlocked();
         uint256 id = currentBatchId;
         // Escrow until settlement. Calls ERC20._update directly: the vault's own
         // escrow is the only path allowed to move shares into the vault (see _update).
@@ -292,8 +317,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         emit RedeemRequested(msg.sender, id, shares);
     }
 
-    /// @notice Take back your whole redeem request from the open (unsettled) batch.
-    /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
+    /// @notice Take back your whole redeem request from the open (unsettled) batch. Not
+    /// while the batch is locked (see lockBatch).
     function cancelRedeemRequest() external nonReentrant {
         _cancelRedeem(msg.sender, msg.sender);
     }
@@ -306,13 +331,14 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     }
 
     function _cancelRedeem(address controller, address receiver) private {
+        _requireUnlocked();
         uint256 id = currentBatchId;
         uint256 shares = redeemRequestOf[id][controller];
         if (shares == 0) revert NothingToCancel();
         redeemRequestOf[id][controller] = 0;
         batches[id].redeemShares -= shares.toUint128();
         _transfer(address(this), receiver, shares);
-        emit RedeemRequestCancelled(controller, id, shares);
+        emit RedeemRequestCancelled(controller, id, msg.sender, receiver, shares);
     }
 
     // ---------------------------------------------------------------------
@@ -326,8 +352,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// sandwich that moves pool prices around this call makes it revert instead of settling
     /// at a manipulated NAV. Also reverts if the price moved more than maxCycleMoveBps since
     /// the last settlement (skipped on the first settlement and whenever the supply is zero).
-    /// @dev Requests in the open batch can be cancelled until this lands (a later plan
-    /// may add a pre-settlement cancel cutoff).
+    /// @dev Unless the keeper locked the batch first (lockBatch), requests in it can be
+    /// cancelled, and redeem requests added, until this lands.
     function settle(uint256 expectedPrice) external onlyRole(KEEPER_ROLE) {
         if (expectedPrice == 0) revert ParamOutOfBounds();
         uint256 next = lastSettleTime + minSettleInterval;
@@ -339,7 +365,6 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// genuine market move (e.g. a crash) the guardian has reviewed. Bounded: reverts
     /// unless the live price is within `toleranceBps` of the `expectedPrice` the guardian
     /// reviewed, so the override cannot accept whatever price exists when the tx lands.
-    /// @dev Requests in the open batch can be cancelled until this lands.
     function settleAcceptingPriceMove(uint256 expectedPrice, uint256 toleranceBps)
         external
         onlyRole(GUARDIAN_ROLE)
@@ -348,6 +373,26 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
             revert ParamOutOfBounds();
         }
         _settle(true, expectedPrice, toleranceBps);
+    }
+
+    /// @notice Keeper: lock the open batch before settling it, for at most BATCH_LOCK, so a
+    /// last-moment redeem request or cancellation cannot change what it settles (a redeem
+    /// request after the keeper freed idle USDC would make settlement revert). Each batch
+    /// can be locked once, and only after it has been open for BATCH_LOCK, so requests are
+    /// always possible for at least that long per batch. Deposit requests and in-kind exits
+    /// stay open.
+    function lockBatch() external onlyRole(KEEPER_ROLE) whenNotPaused {
+        uint256 id = currentBatchId;
+        if (lastLockedBatch == id || block.timestamp < lastSettleTime + BATCH_LOCK) revert CannotLock();
+        lastLockedBatch = id;
+        uint256 until = block.timestamp + BATCH_LOCK;
+        batchLockedUntil = until;
+        emit BatchLocked(id, until);
+    }
+
+    function _requireUnlocked() private view {
+        uint256 until = batchLockedUntil;
+        if (block.timestamp < until) revert BatchIsLocked(until);
     }
 
     function _settle(bool guardianOverride, uint256 expectedPrice, uint256 toleranceBps)
@@ -398,6 +443,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         b.settled = true;
         lastSharePrice = price;
         lastSettleTime = block.timestamp;
+        batchLockedUntil = 0;
         currentBatchId = id + 1;
 
         emit BatchSettled(id, price, b.depositAssets, depositShares, b.redeemShares, redeemAssets);
