@@ -20,7 +20,7 @@ library VaultRebalance {
         bytes32 poolId;
         Shapes.Spec spec;
         uint256 usdcAmount; // from idle USDC
-        uint256 tokenAmount; // from token inventory (after the unwind)
+        uint256 tokenAmount; // from token inventory after the unwind; type(uint256).max = all of it
         int24 expectedTick; // the keeper's view of the pool's current tick
         uint256 deadline;
     }
@@ -30,6 +30,7 @@ library VaultRebalance {
         int24 maxTickDeviation; // current tick vs Args.expectedTick
         uint32 twapWindow; // v3 only
         int24 maxTwapDeviation; // v3 only: current tick vs TWAP
+        uint16 minObservations; // v3 only: the pool's observation capacity floor
     }
 
     event Rebalanced(
@@ -70,11 +71,12 @@ library VaultRebalance {
         int24 tick = _checkPrice(e, m, a, l);
 
         usdcIn = _unwind(b, e, a.poolId);
+        if (a.tokenAmount == type(uint256).max) a.tokenAmount = b.tokenBalance[m.token];
         Shapes.Range[] memory ranges =
             Shapes.layout(a.spec, tick, m.tickSpacing, m.usdcIsToken0, a.usdcAmount, a.tokenAmount);
         uint256 available = idle + usdcIn;
         for (uint256 i = 0; i < ranges.length; i++) {
-            if (ranges[i].usdc == 0 && ranges[i].token == 0) continue;
+            if (_skip(ranges[i], tick)) continue;
             (, uint256 spent,) = VaultOps.open(
                 b,
                 e,
@@ -127,8 +129,16 @@ library VaultRebalance {
         int24 dev = tick > a.expectedTick ? tick - a.expectedTick : a.expectedTick - tick;
         if (dev > l.maxTickDeviation) revert TickNotAsExpected(tick, a.expectedTick);
         if (m.protocol == VaultBook.Protocol.V3) {
-            PoolOracle.requireNearTwap(m.v3Pool, l.twapWindow, l.maxTwapDeviation);
+            PoolOracle.requireNearTwap(m.v3Pool, l.twapWindow, l.maxTwapDeviation, l.minObservations);
         }
+    }
+
+    /// @dev Nothing to deploy; or the range containing the price is missing one token, so it
+    /// would take zero liquidity (e.g. a BOTH layout from USDC only): skip it.
+    function _skip(Shapes.Range memory r, int24 tick) private pure returns (bool) {
+        if (r.usdc == 0 && r.token == 0) return true;
+        bool containsPrice = r.tickLower <= tick && tick < r.tickUpper;
+        return containsPrice && (r.usdc == 0 || r.token == 0);
     }
 
     /// @dev Withdraw, harvest and burn every position the vault has in `poolId`.

@@ -32,7 +32,11 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// pushed around a keeper action, but within them a compromised keeper colluding with
 /// someone who moves a price can still trade at that price (up to the pool's allocation),
 /// and the keeper picks the expected price each settlement is checked against. Hookless v4
-/// pools have no TWAP. Run the keeper with private transaction submission and off-chain
+/// pools have no TWAP, so a v4 rebalance is bounded only by the keeper's own expected tick:
+/// measured at 100k NAV with a 30% pool cap, a compromised keeper plus a colluding price
+/// mover lost ~2.9% of NAV at a ~49% push and up to ~16.6% of NAV (57% of the deployed
+/// amount) at an extreme push in one transaction, versus ~0.8% of NAV in a v3 pool, where
+/// the TWAP caps the push. An honest keeper's exposure is the tick band (~1%). Run the keeper with private transaction submission and off-chain
 /// fair prices (its expected settlement price must come from those, never from this vault's
 /// own `sharePrice()` read just before settling, which would undo the protection).
 /// @dev Accounting never takes token balances as truth: idle USDC (`idleAssets`) and token
@@ -113,12 +117,17 @@ contract AbyssiaVault is AsyncBatchVault {
     int24 public maxRebalanceTickDeviation = 100;
     uint32 public twapWindow = 10 minutes;
     int24 public maxTwapDeviation = 500;
+    /// @notice Minimum observation capacity a v3 pool must keep for its TWAP to count (see
+    /// PoolOracle.requireNearTwap): about twapWindow / block time, with margin. Raise a
+    /// pool's capacity once with `increaseObservationCardinalityNext` before using it.
+    uint16 public minObservations = 1_200;
 
     event SliceSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event HarvestSkipped(VaultBook.Protocol indexed protocol, uint256 indexed tokenId);
     event OwedClaimed(address indexed receiver, address indexed token, address to, uint256 amount);
     event MaxSwapSlippageBpsSet(uint256 value);
     event PriceGuardsSet(int24 maxRebalanceTickDeviation, uint32 twapWindow, int24 maxTwapDeviation);
+    event MinObservationsSet(uint16 value);
     event Rebalanced(
         bytes32 indexed poolId, uint8 shape, uint8 side, uint8 ranges, int24 width, uint256 entryValue
     );
@@ -179,6 +188,7 @@ contract AbyssiaVault is AsyncBatchVault {
     error StopLossNotReached(uint256 value, uint256 trigger);
     error TwapUnavailable(address pool, uint32 window);
     error PriceOffTwap(int24 tick, int24 twapTick);
+    error ObservationCapacityTooLow(address pool, uint16 capacity, uint16 required);
     error InvalidShape();
     error InvalidSide();
     error InvalidRangeCount();
@@ -235,7 +245,7 @@ contract AbyssiaVault is AsyncBatchVault {
             _book,
             _env(),
             a,
-            VaultRebalance.Limits(maxRebalanceTickDeviation, twapWindow, maxTwapDeviation),
+            VaultRebalance.Limits(maxRebalanceTickDeviation, twapWindow, maxTwapDeviation, minObservations),
             idleAssets
         );
         _increaseIdle(usdcIn);
@@ -299,7 +309,14 @@ contract AbyssiaVault is AsyncBatchVault {
             _book,
             _env(),
             VaultOps.SwapArgs(
-                poolId, usdcIn, amountIn, minOut, maxSwapSlippageBps, twapWindow, maxTwapDeviation
+                poolId,
+                usdcIn,
+                amountIn,
+                minOut,
+                maxSwapSlippageBps,
+                twapWindow,
+                maxTwapDeviation,
+                minObservations
             ),
             idleAssets
         );
@@ -372,6 +389,13 @@ contract AbyssiaVault is AsyncBatchVault {
         ) revert ParamOutOfBounds();
         (maxRebalanceTickDeviation, twapWindow, maxTwapDeviation) = (tickDeviation, window, twapDeviation);
         emit PriceGuardsSet(tickDeviation, window, twapDeviation);
+    }
+
+    /// @notice Admin: the v3 observation capacity floor.
+    function setMinObservations(uint16 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (value == 0) revert ParamOutOfBounds();
+        minObservations = value;
+        emit MinObservationsSet(value);
     }
 
     /// @notice Guardian may only narrow the tick band and the TWAP deviation, instantly.

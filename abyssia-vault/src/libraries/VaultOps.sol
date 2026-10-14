@@ -43,6 +43,7 @@ library VaultOps {
         uint256 maxSlippageBps;
         uint32 twapWindow;
         int24 maxTwapDeviation;
+        uint16 minObservations;
     }
 
     /// @dev Class of the pool new exposure went to, for the vault's allocation check.
@@ -259,7 +260,7 @@ library VaultOps {
         }
         // v3 pools: the price must also be near its TWAP (hookless v4 pools have no oracle).
         if (m.protocol == VaultBook.Protocol.V3) {
-            PoolOracle.requireNearTwap(m.v3Pool, a.twapWindow, a.maxTwapDeviation);
+            PoolOracle.requireNearTwap(m.v3Pool, a.twapWindow, a.maxTwapDeviation, a.minObservations);
         }
         uint160 sqrtP = VaultBook.sqrtPrice(m, e.stateView, a.poolId);
         uint256 atPrice = a.usdcIn

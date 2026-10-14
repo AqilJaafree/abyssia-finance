@@ -80,6 +80,9 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         (v3Pool, v3PoolId) = _addV3Pool(address(meme));
         (v4Key, v4PoolId) = _addV4Pool(address(meme));
         vault = new AbyssiaVault(_config());
+        // Fixture: test pools reserve 64 observations (production default is 1,200).
+        vm.prank(admin);
+        vault.setMinObservations(64);
         // Let the v3 pools' TWAP window fill (the vault's v3 swaps and rebalances need it).
         vm.warp(block.timestamp + vault.twapWindow());
     }

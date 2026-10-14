@@ -10,6 +10,7 @@ import {IUniswapV3Pool} from "../interfaces/IUniswapV3Pool.sol";
 /// `increaseObservationCardinalityNext` and let the window fill.
 library PoolOracle {
     error TwapUnavailable(address pool, uint32 window);
+    error ObservationCapacityTooLow(address pool, uint16 capacity, uint16 required);
     error PriceOffTwap(int24 tick, int24 twapTick);
 
     /// @notice Arithmetic-mean tick over the last `window` seconds (rounded toward negative
@@ -28,10 +29,18 @@ library PoolOracle {
         }
     }
 
-    /// @notice Revert unless the pool's current tick is within `maxDeviation` ticks of its
-    /// TWAP over `window` seconds (1 tick ~ 0.01% in price).
-    function requireNearTwap(address pool, uint32 window, int24 maxDeviation) internal view {
-        (, int24 tick,,,,,) = IUniswapV3Pool(pool).slot0();
+    /// @notice Revert unless the pool keeps at least `minCapacity` observations and its
+    /// current tick is within `maxDeviation` ticks of its TWAP over `window` seconds (1 tick
+    /// ~ 0.01% in price). The capacity floor stops anyone from making the TWAP unavailable by
+    /// overwriting a small ring of observations with a swap every block: size it as
+    /// window / block time, with margin. It checks the capacity the pool has committed to
+    /// (`observationCardinalityNext`): the ring grows into it before any slot is overwritten.
+    function requireNearTwap(address pool, uint32 window, int24 maxDeviation, uint16 minCapacity)
+        internal
+        view
+    {
+        (, int24 tick,,, uint16 capacity,,) = IUniswapV3Pool(pool).slot0();
+        if (capacity < minCapacity) revert ObservationCapacityTooLow(pool, capacity, minCapacity);
         int24 avg = twapTick(pool, window);
         int24 dev = tick > avg ? tick - avg : avg - tick;
         if (dev > maxDeviation) revert PriceOffTwap(tick, avg);

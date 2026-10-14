@@ -14,6 +14,10 @@ import {PoolOracle} from "../../src/libraries/PoolOracle.sol";
 import {PoolKey} from "../../src/types/PoolKey.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 
+interface IUniswapV3PoolCap {
+    function increaseObservationCardinalityNext(uint16 next) external;
+}
+
 interface IPoolManagerInitR {
     function initialize(PoolKey memory key, uint160 sqrtPriceX96) external returns (int24);
 }
@@ -258,6 +262,7 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         (address t0, address t1) = _sorted(address(fresh));
         address pool = IV3FactoryInit(v3.factory).createPool(t0, t1, FEE);
         IV3PoolInit(pool).initialize(TickMath.getSqrtPriceAtTick(0));
+        IUniswapV3PoolCap(pool).increaseObservationCardinalityNext(64); // capacity is fine, history isn't
         vm.prank(admin);
         bytes32 poolId = registry.addV3Pool(address(fresh), FEE, MEMECOIN);
         VaultRegistry.ClassParams memory p = _classParams();
@@ -269,6 +274,46 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(PoolOracle.TwapUnavailable.selector, pool, uint32(600)));
         vault.rebalance(a);
+    }
+
+    /// A v3 pool that keeps too few observations could have its TWAP wiped by a swap every
+    /// block: the vault refuses to rely on it.
+    function test_v3ObservationCapacityFloor() public {
+        vm.prank(admin);
+        vault.setMinObservations(1_200);
+        VaultRebalance.Args memory a =
+            _rebalanceArgs(v3PoolId, _spec(Shapes.SPOT, Shapes.USDC_ONLY, 1, 60), 1e6, 0);
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(PoolOracle.ObservationCapacityTooLow.selector, v3Pool, 64, 1_200)
+        );
+        vault.rebalance(a);
+        IUniswapV3PoolCap(v3Pool).increaseObservationCardinalityNext(1_200);
+        vm.prank(keeper);
+        vault.rebalance(a);
+        assertEq(vault.minObservations(), 1_200);
+        vm.prank(admin);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setMinObservations(0);
+    }
+
+    /// A BOTH layout from USDC only skips the range containing the price (it would take zero
+    /// liquidity) instead of reverting.
+    function test_bothFromUsdcOnlySkipsTheMiddleRange() public {
+        _rebalance(v4PoolId, _spec(Shapes.SPOT, Shapes.BOTH, 3, 120), 900e6, 0);
+        (, uint256 n4) = vault.positionCount();
+        assertEq(n4, 1); // only the range on USDC's side
+        // USDC splits evenly between the middle range and the USDC-side range; the middle
+        // share stays idle.
+        assertApproxEqAbs(vault.idleAssets(), 9_550e6, 2);
+    }
+
+    /// tokenAmount = max deploys all of the token, including what the unwind returned.
+    function test_tokenAmountMaxUsesAllInventory() public {
+        uint256 got = _keeperSwap(v4PoolId, true, 1_000e6);
+        _rebalance(v4PoolId, _spec(Shapes.SPOT, Shapes.TOKEN_ONLY, 2, 600), 0, got);
+        _rebalance(v4PoolId, _spec(Shapes.SPOT, Shapes.TOKEN_ONLY, 3, 600), 0, type(uint256).max);
+        assertLt(vault.tokenBalance(address(meme)), 10); // only rounding dust left
     }
 
     // ---------------------------------------------------------------------
