@@ -10,11 +10,14 @@ optimizer_runs = 200
 fuzz = { runs = 1000 }
 ignored_warnings_from = ["node_modules"]
 # Tests and the testnet deploy script read Uniswap's official v3 build artifacts
-# (v3 is not deployed on Arc testnet).
+# (v3 is not deployed on Arc testnet), and the official v4 build artifacts to deploy
+# v4 locally (byte-identical to Arc's deployment apart from immutables).
 fs_permissions = [
     { access = "read", path = "./node_modules/@uniswap/v3-core/artifacts" },
     { access = "read", path = "./node_modules/@uniswap/v3-periphery/artifacts" },
     { access = "read", path = "./script/artifacts" },
+    { access = "read", path = "./node_modules/@uniswap/v4-core/out" },
+    { access = "read", path = "./node_modules/@uniswap/v4-periphery/foundry-out" },
 ]
 
 [fmt]
