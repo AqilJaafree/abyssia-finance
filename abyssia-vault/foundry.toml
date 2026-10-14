@@ -9,6 +9,14 @@ optimizer = true
 optimizer_runs = 200
 fuzz = { runs = 1000 }
 ignored_warnings_from = ["node_modules"]
+# AbyssiaVault (and whatever imports it) compiles with the IR pipeline: its keeper and
+# in-kind exit paths exceed the legacy pipeline's stack limit. Everything else, including
+# the already-reviewed v3/v4 libraries' own tests, keeps the default pipeline.
+additional_compiler_profiles = [{ name = "via-ir", via_ir = true }]
+compilation_restrictions = [
+    { paths = "src/AbyssiaVault.sol", via_ir = true },
+    { paths = "src/libraries/VaultOps.sol", via_ir = true },
+]
 # Tests and the testnet deploy script read Uniswap's official v3 build artifacts
 # (v3 is not deployed on Arc testnet), and the official v4 build artifacts to deploy
 # v4 locally (byte-identical to Arc's deployment apart from immutables).

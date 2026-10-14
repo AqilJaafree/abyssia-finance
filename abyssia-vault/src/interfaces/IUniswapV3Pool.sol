@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-/// @notice Minimal Uniswap v3 pool surface the registry needs.
+/// @notice Minimal Uniswap v3 pool surface the registry and vault need.
 interface IUniswapV3Pool {
     function slot0()
         external
@@ -15,4 +15,6 @@ interface IUniswapV3Pool {
             uint8 feeProtocol,
             bool unlocked
         );
+
+    function liquidity() external view returns (uint128);
 }

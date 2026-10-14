@@ -14,4 +14,9 @@ contract MockV3Pool is IUniswapV3Pool {
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
         return (sqrtPrice, 0, 0, 0, 0, 0, true);
     }
+
+    // Unused by the registry tests that use this mock.
+    function liquidity() external pure returns (uint128) {
+        return 0;
+    }
 }
