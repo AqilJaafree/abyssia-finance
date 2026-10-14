@@ -33,21 +33,23 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         assertEq(vault.balanceOf(treasury), 0);
     }
 
-    /// A gain is not charged mid-period; at the first settlement after the period ends the
-    /// treasury's new shares are worth 15% of it and holders keep 85%.
-    function test_performanceFeeOnlyWhenThePeriodEnds() public {
-        _depositAndClaim(alice, 100 * USDC);
+    /// A gain is charged only once it has held through a whole period: the period it was made
+    /// in opened below it, so it is charged at the close of the next one. Holders keep 85%.
+    function test_gainIsChargedOnceItHoldsThroughAPeriod() public {
+        _depositAndClaim(alice, 100 * USDC); // period 1 opens at 1.00
         _gain(10 * USDC);
-        _settle();
+        _settle(); // 1.10
+        assertEq(vault.feePeriodLow(), 1e6);
+        _settleAfterPeriod(); // period 1's low was its 1.00 opening: nothing charged
         assertEq(vault.balanceOf(treasury), 0);
-        assertApproxEqAbs(vault.feePeriodLow(), 1.1e6, 1);
-        _settleAfterPeriod();
+        assertApproxEqAbs(vault.feePeriodLow(), 1.1e6, 1); // period 2 opens at 1.10
+        _settleAfterPeriod(); // the gain held through period 2
         uint256 treasuryValue = vault.convertToAssets(vault.balanceOf(treasury));
         assertApproxEqRel(treasuryValue, 1.5e6, 0.0001e18); // 15% of 10 USDC (virtual-share rounding)
         assertApproxEqRel(vault.convertToAssets(vault.balanceOf(alice)), 108.5e6, 0.0001e18);
         assertApproxEqAbs(vault.highWaterMark(), 1.085e6, 1);
         assertEq(vault.lastSharePrice(), vault.highWaterMark());
-        assertEq(vault.feePeriodLow(), 0); // a new period started
+        assertEq(vault.feePeriodLow(), vault.lastSharePrice()); // period 3 opens at the post-fee price
     }
 
     /// M-2: a spike that does not hold through the period is never charged.
@@ -68,13 +70,14 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
     function test_gainAboveThePeriodLowCarriesToTheNextPeriod() public {
         _depositAndClaim(alice, 100 * USDC);
         _gain(10 * USDC);
-        _settle(); // 1.10: the low
+        _settle(); // 1.10
+        _settleAfterPeriod(); // period 2 opens at 1.10
         _gain(10 * USDC);
-        _settleAfterPeriod(); // 1.20 at the close: charged on 1.00 -> 1.10 only
+        _settle(); // 1.20
+        _settleAfterPeriod(); // period 2's low is 1.10: charged on 1.00 -> 1.10 only
         assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 1.5e6, 0.0001e18);
         assertApproxEqAbs(vault.highWaterMark(), 1.085e6, 1); // 1.10 less the 0.015 fee per share
-        _settle(); // 1.185, held
-        _settleAfterPeriod();
+        _settleAfterPeriod(); // 1.185 held through period 3
         // Now the remaining 0.10 per share is charged too: 1.5 USDC more.
         assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 3e6, 0.001e18);
     }
@@ -84,13 +87,51 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         _depositAndClaim(alice, 100 * USDC);
         _gain(10 * USDC);
         _settle();
+        _settleAfterPeriod();
         _settleAfterPeriod(); // mark 1.085
         uint256 tBefore = vault.balanceOf(treasury);
-        // Drop 5%, then recover 4%: still below the mark at the next close.
+        assertGt(tBefore, 0);
+        // Drop 5%, then recover 4%: still below the mark at the next closes.
         vault.harnessDecreaseIdle(5 * USDC);
         _settle();
         _gain(4 * USDC);
         _settleAfterPeriod();
+        _settleAfterPeriod();
+        assertEq(vault.balanceOf(treasury), tBefore);
+    }
+
+    /// Review M-1: a settlement with deposits or redemptions charges the gain that has held
+    /// (up to the period's low) before converting the batch, so an entrant does not pay it.
+    function test_flowSettlementChargesTheHeldGainFirst() public {
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(10 * USDC);
+        _settle();
+        _settleAfterPeriod(); // period 2 opens at 1.10, nothing charged yet
+        vm.warp(block.timestamp + 1 days);
+        _requestDeposit(bob, 110 * USDC);
+        (uint256 pre, uint256 post) = vault.previewSettlePrice();
+        uint256 id = vault.currentBatchId();
+        vm.prank(keeper);
+        vault.settle(pre);
+        assertEq(vault.lastSharePrice(), post);
+        assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 1.5e6, 0.0001e18);
+        vm.prank(bob);
+        uint256 bobShares = vault.claimDeposit(id, bob);
+        _settleAfterPeriod(); // no price move: bob pays nothing
+        assertApproxEqRel(vault.convertToAssets(bobShares), 110e6, 0.0001e18);
+    }
+
+    /// A fee change first charges the gain that has held at the old rate.
+    function test_feeChangeChargesTheHeldGainAtTheOldRate() public {
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(10 * USDC);
+        _settle();
+        _settleAfterPeriod(); // period 2 opens at 1.10
+        vm.prank(admin);
+        vault.setFees(3_000, 0);
+        assertApproxEqRel(vault.convertToAssets(vault.balanceOf(treasury)), 1.5e6, 0.0001e18); // 15%
+        uint256 tBefore = vault.balanceOf(treasury);
+        _settleAfterPeriod(); // no new gain: nothing more at 30%
         assertEq(vault.balanceOf(treasury), tBefore);
     }
 
@@ -144,6 +185,24 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         vault.settle(pre);
         assertEq(vault.lastSharePrice(), post);
         assertGt(vault.balanceOf(treasury), 0);
+    }
+
+    /// previewSettlePrice equals the post-fee price the batch converts at, with both fees
+    /// on, at or after a period close, with or without a deposit in the batch.
+    function testFuzz_previewMatchesSettlement(uint96 g1, uint96 g2, uint32 dt, bool flows) public {
+        vm.prank(admin);
+        vault.setFees(3_000, 200);
+        _depositAndClaim(alice, 100 * USDC);
+        _gain(bound(g1, 0, 15 * USDC));
+        _settle();
+        _settleAfterPeriod();
+        _gain(bound(g2, 0, 15 * USDC));
+        vm.warp(block.timestamp + bound(dt, 1 hours, 2 * PERIOD));
+        if (flows) _requestDeposit(bob, 10 * USDC);
+        (uint256 pre, uint256 post) = vault.previewSettlePrice();
+        vm.prank(keeper);
+        vault.settle(pre);
+        assertEq(vault.lastSharePrice(), post);
     }
 
     function test_previewBeforeTheFirstSettlement() public view {
@@ -201,6 +260,7 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         uint256 shares = _depositAndClaim(alice, 100 * USDC);
         _gain(15 * USDC); // within the 20% cycle guard
         _settle();
+        _settleAfterPeriod();
         _settleAfterPeriod(); // mark ~1.1275
         vm.prank(alice);
         vault.redeemInKind(shares, alice);
@@ -214,7 +274,8 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         _gain(10 * USDC);
         _settle();
         _settleAfterPeriod();
-        assertGt(vault.balanceOf(treasury), 0); // the new gain is charged
+        _settleAfterPeriod();
+        assertGt(vault.balanceOf(treasury), 0); // the new gain is charged once it holds
     }
 
     function _settleAfterPeriod() internal {
