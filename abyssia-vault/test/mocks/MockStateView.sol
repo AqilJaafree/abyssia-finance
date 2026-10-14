@@ -14,4 +14,21 @@ contract MockStateView is IStateView {
     function getSlot0(bytes32 poolId) external view returns (uint160, int24, uint24, uint24) {
         return (sqrtPrice[poolId], 0, 0, 0);
     }
+
+    // Unused by the registry tests that use this mock.
+    function getLiquidity(bytes32) external pure returns (uint128) {
+        return 0;
+    }
+
+    function getPositionInfo(bytes32, address, int24, int24, bytes32)
+        external
+        pure
+        returns (uint128, uint256, uint256)
+    {
+        return (0, 0, 0);
+    }
+
+    function getFeeGrowthInside(bytes32, int24, int24) external pure returns (uint256, uint256) {
+        return (0, 0);
+    }
 }

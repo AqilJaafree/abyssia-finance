@@ -8,6 +8,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {IV4PositionManager} from "../interfaces/IV4PositionManager.sol";
 import {IPermit2} from "../interfaces/IPermit2.sol";
 import {IStateView} from "../interfaces/IStateView.sol";
@@ -25,9 +26,12 @@ import {PoolKey, PoolKeyLib} from "../types/PoolKey.sol";
 /// accrued. Every function that removes liquidity therefore first HARVESTS the fees to
 /// the vault in a separate `modifyLiquidities` call (decrease by 0 + take), then removes
 /// principal to the recipient. Fees always belong to the vault, never to an exiting
-/// holder. All amounts returned are BALANCE DELTAS (fee-on-transfer safe): fees are the
-/// vault's delta, principal is the recipient's delta. The vault must credit harvested
-/// fees in the same transaction (or `sweepSurplus` treats them as surplus).
+/// holder. Amounts returned are BALANCE DELTAS (fee-on-transfer safe: fees are the
+/// vault's delta, principal is the recipient's delta) CAPPED by what Uniswap's own math
+/// says was paid (fees from StateView fee growth, principal from the pool formula), so a
+/// token that lies in `balanceOf` can never make the vault credit more than it received.
+/// `open` reports the larger of the balance delta and the pool-math cost. The vault must
+/// credit harvested fees in the same transaction (or `sweepSurplus` treats them as surplus).
 ///
 /// IN-KIND EXITS use the same REQUIRED VAULT PATTERN as V3Positions (reference:
 /// test/v4/V4PositionsHarness.sol): a transient-bound, gas-capped `try` self-call per
@@ -115,6 +119,10 @@ library V4Positions {
         if (liquidity == 0) revert ZeroLiquidity();
         tokenId = posm.nextTokenId();
         (spent0, spent1) = _mint(posm, permit2, p, liquidity);
+        // Never report less than the pool-math cost (rounded up, as the pool charges it).
+        (uint256 cost0, uint256 cost1) = _costOf(stateView, p, liquidity);
+        if (cost0 > spent0) spent0 = cost0;
+        if (cost1 > spent1) spent1 = cost1;
         if (spent0 < p.amount0Min || spent1 < p.amount1Min) revert Slippage(spent0, spent1);
 
         s.tokenIds.push(tokenId);
@@ -129,6 +137,7 @@ library V4Positions {
     function withdraw(
         State storage s,
         IV4PositionManager posm,
+        IStateView stateView,
         uint256 tokenId,
         uint128 liquidity,
         uint256 amount0Min,
@@ -138,17 +147,23 @@ library V4Positions {
     ) external returns (uint256 fee0, uint256 fee1, uint256 amount0, uint256 amount1) {
         _requireKnown(s, tokenId);
         _checkRecipient(recipient);
-        return _withdraw(posm, tokenId, liquidity, amount0Min, amount1Min, deadline, recipient);
+        return
+            _withdraw(
+                posm, stateView, Removal(tokenId, liquidity, amount0Min, amount1Min, deadline, recipient)
+            );
     }
 
     /// @notice Send all fees the position has accrued to the vault.
-    function collectFees(State storage s, IV4PositionManager posm, uint256 tokenId, uint256 deadline)
-        external
-        returns (uint256 fee0, uint256 fee1)
-    {
+    function collectFees(
+        State storage s,
+        IV4PositionManager posm,
+        IStateView stateView,
+        uint256 tokenId,
+        uint256 deadline
+    ) external returns (uint256 fee0, uint256 fee1) {
         _requireKnown(s, tokenId);
-        (PoolKey memory key,) = posm.getPoolAndPositionInfo(tokenId);
-        return _harvest(posm, key, tokenId, deadline);
+        (PoolKey memory key, uint256 info) = posm.getPoolAndPositionInfo(tokenId);
+        return _harvest(posm, stateView, key, info, tokenId, deadline);
     }
 
     /// @notice Burn an empty (zero-liquidity) position NFT and drop it from the list.
@@ -179,6 +194,7 @@ library V4Positions {
     function withdrawSlice(
         State storage s,
         IV4PositionManager posm,
+        IStateView stateView,
         uint256 tokenId,
         uint256 shares,
         uint256 supply,
@@ -192,7 +208,7 @@ library V4Positions {
         // shares <= supply, so the slice never exceeds the position's liquidity.
         // mulDiv: no intermediate overflow, whatever the share supply.
         uint128 part = Math.mulDiv(liquidity, shares, supply).toUint128();
-        return _withdraw(posm, tokenId, part, 0, 0, deadline, recipient);
+        return _withdraw(posm, stateView, Removal(tokenId, part, 0, 0, deadline, recipient));
     }
 
     function count(State storage s) external view returns (uint256) {
@@ -216,16 +232,36 @@ library V4Positions {
         if (liquidity == 0) return (0, 0);
         (PoolKey memory key, uint256 info) = posm.getPoolAndPositionInfo(tokenId);
         (uint160 sqrtP,,,) = stateView.getSlot0(key.toId());
-        uint160 sqrtA = TickMath.getSqrtPriceAtTick(_tickLower(info));
-        uint160 sqrtB = TickMath.getSqrtPriceAtTick(_tickUpper(info));
+        return _amountsFor(sqrtP, _tickLower(info), _tickUpper(info), liquidity, false);
+    }
+
+    /// @dev Token amounts of `liquidity` in [tickLower, tickUpper) at `sqrtP`, rounded the
+    /// way the pool rounds: up when it is paid in, down when it is paid out.
+    function _amountsFor(uint160 sqrtP, int24 tickLower, int24 tickUpper, uint128 liquidity, bool roundUp)
+        private
+        pure
+        returns (uint256 amount0, uint256 amount1)
+    {
+        uint160 sqrtA = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtB = TickMath.getSqrtPriceAtTick(tickUpper);
         if (sqrtP <= sqrtA) {
-            amount0 = SqrtPriceMath.getAmount0Delta(sqrtA, sqrtB, liquidity, false);
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtA, sqrtB, liquidity, roundUp);
         } else if (sqrtP < sqrtB) {
-            amount0 = SqrtPriceMath.getAmount0Delta(sqrtP, sqrtB, liquidity, false);
-            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtP, liquidity, false);
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtP, sqrtB, liquidity, roundUp);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtP, liquidity, roundUp);
         } else {
-            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtB, liquidity, false);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtB, liquidity, roundUp);
         }
+    }
+
+    function _costOf(IStateView stateView, OpenParams calldata p, uint128 liquidity)
+        private
+        view
+        returns (uint256, uint256)
+    {
+        PoolKey memory key = p.key;
+        (uint160 sqrtP,,,) = stateView.getSlot0(key.toId());
+        return _amountsFor(sqrtP, p.tickLower, p.tickUpper, liquidity, true);
     }
 
     /// @dev Liquidity the desired amounts buy at the pool's current price (rounded down).
@@ -273,50 +309,98 @@ library V4Positions {
         _resetApproval(c1, permit2, posm);
     }
 
-    function _withdraw(
-        IV4PositionManager posm,
-        uint256 tokenId,
-        uint128 liquidity,
-        uint256 amount0Min,
-        uint256 amount1Min,
-        uint256 deadline,
-        address recipient
-    ) private returns (uint256 fee0, uint256 fee1, uint256 amount0, uint256 amount1) {
-        (PoolKey memory key,) = posm.getPoolAndPositionInfo(tokenId);
-        // Fees first, to the vault: otherwise the decrease below would pay them to `recipient`.
-        (fee0, fee1) = _harvest(posm, key, tokenId, deadline);
-        if (liquidity == 0) return (fee0, fee1, 0, 0);
+    /// @dev One liquidity removal, bundled to keep the stack shallow.
+    struct Removal {
+        uint256 tokenId;
+        uint128 liquidity;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        uint256 deadline;
+        address recipient;
+    }
 
-        uint256 before0 = IERC20(key.currency0).balanceOf(recipient);
-        uint256 before1 = IERC20(key.currency1).balanceOf(recipient);
+    function _withdraw(IV4PositionManager posm, IStateView stateView, Removal memory r)
+        private
+        returns (uint256 fee0, uint256 fee1, uint256 amount0, uint256 amount1)
+    {
+        (PoolKey memory key, uint256 info) = posm.getPoolAndPositionInfo(r.tokenId);
+        // Fees first, to the vault: otherwise the decrease below would pay them to `recipient`.
+        (fee0, fee1) = _harvest(posm, stateView, key, info, r.tokenId, r.deadline);
+        if (r.liquidity == 0) return (fee0, fee1, 0, 0);
+        (amount0, amount1) = _decrease(posm, stateView, key, info, r);
+    }
+
+    /// @dev Remove principal to `r.recipient`; report its balance delta capped by what the
+    /// pool pays out (rounded down), computed before the call.
+    function _decrease(
+        IV4PositionManager posm,
+        IStateView stateView,
+        PoolKey memory key,
+        uint256 info,
+        Removal memory r
+    ) private returns (uint256 amount0, uint256 amount1) {
+        (uint160 sqrtP,,,) = stateView.getSlot0(key.toId());
+        (uint256 max0, uint256 max1) =
+            _amountsFor(sqrtP, _tickLower(info), _tickUpper(info), r.liquidity, false);
+        uint256 before0 = IERC20(key.currency0).balanceOf(r.recipient);
+        uint256 before1 = IERC20(key.currency1).balanceOf(r.recipient);
         bytes[] memory params = new bytes[](2);
         params[0] = abi.encode(
-            tokenId, uint256(liquidity), amount0Min.toUint128(), amount1Min.toUint128(), bytes("")
+            r.tokenId, uint256(r.liquidity), r.amount0Min.toUint128(), r.amount1Min.toUint128(), bytes("")
         );
-        params[1] = abi.encode(key.currency0, key.currency1, recipient);
-        posm.modifyLiquidities(abi.encode(abi.encodePacked(DECREASE_LIQUIDITY, TAKE_PAIR), params), deadline);
-        amount0 = IERC20(key.currency0).balanceOf(recipient) - before0;
-        amount1 = IERC20(key.currency1).balanceOf(recipient) - before1;
-        emit V4LiquidityWithdrawn(tokenId, liquidity, recipient, amount0, amount1);
+        params[1] = abi.encode(key.currency0, key.currency1, r.recipient);
+        posm.modifyLiquidities(
+            abi.encode(abi.encodePacked(DECREASE_LIQUIDITY, TAKE_PAIR), params), r.deadline
+        );
+        amount0 = Math.min(IERC20(key.currency0).balanceOf(r.recipient) - before0, max0);
+        amount1 = Math.min(IERC20(key.currency1).balanceOf(r.recipient) - before1, max1);
+        emit V4LiquidityWithdrawn(r.tokenId, r.liquidity, r.recipient, amount0, amount1);
     }
 
     /// @dev Decrease by 0 ("poke") realizes the accrued fees; TAKE_PAIR sends them to the
     /// vault (zero amounts are skipped by the PositionManager). A zero-liquidity position
     /// cannot be poked (and owes no fees), so it is skipped.
-    function _harvest(IV4PositionManager posm, PoolKey memory key, uint256 tokenId, uint256 deadline)
-        private
-        returns (uint256 fee0, uint256 fee1)
-    {
+    function _harvest(
+        IV4PositionManager posm,
+        IStateView stateView,
+        PoolKey memory key,
+        uint256 info,
+        uint256 tokenId,
+        uint256 deadline
+    ) private returns (uint256 fee0, uint256 fee1) {
         if (posm.getPositionLiquidity(tokenId) == 0) return (0, 0);
+        (uint256 owed0, uint256 owed1) = _feesOwed(posm, stateView, key, info, tokenId);
         uint256 before0 = IERC20(key.currency0).balanceOf(address(this));
         uint256 before1 = IERC20(key.currency1).balanceOf(address(this));
         bytes[] memory params = new bytes[](2);
         params[0] = abi.encode(tokenId, uint256(0), uint128(0), uint128(0), bytes(""));
         params[1] = abi.encode(key.currency0, key.currency1, address(this));
         posm.modifyLiquidities(abi.encode(abi.encodePacked(DECREASE_LIQUIDITY, TAKE_PAIR), params), deadline);
-        fee0 = IERC20(key.currency0).balanceOf(address(this)) - before0;
-        fee1 = IERC20(key.currency1).balanceOf(address(this)) - before1;
+        fee0 = Math.min(IERC20(key.currency0).balanceOf(address(this)) - before0, owed0);
+        fee1 = Math.min(IERC20(key.currency1).balanceOf(address(this)) - before1, owed1);
         if (fee0 != 0 || fee1 != 0) emit V4FeesCollected(tokenId, fee0, fee1);
+    }
+
+    /// @dev Fees the PoolManager will pay on the next poke, exactly as v4-core's
+    /// Position.update computes them: (feeGrowthInside - last) * liquidity / 2^128. The
+    /// PositionManager owns the pool position, salted with the tokenId.
+    function _feesOwed(
+        IV4PositionManager posm,
+        IStateView stateView,
+        PoolKey memory key,
+        uint256 info,
+        uint256 tokenId
+    ) private view returns (uint256 owed0, uint256 owed1) {
+        bytes32 poolId = key.toId();
+        int24 tl = _tickLower(info);
+        int24 tu = _tickUpper(info);
+        (uint128 liq, uint256 last0, uint256 last1) =
+            stateView.getPositionInfo(poolId, address(posm), tl, tu, bytes32(tokenId));
+        (uint256 g0, uint256 g1) = stateView.getFeeGrowthInside(poolId, tl, tu);
+        unchecked {
+            owed0 = FullMath.mulDiv(g0 - last0, liq, 1 << 128);
+            owed1 = FullMath.mulDiv(g1 - last1, liq, 1 << 128);
+        }
     }
 
     function _approve(address token, IPermit2 permit2, IV4PositionManager posm, uint256 amount) private {

@@ -292,29 +292,45 @@ contract V4PositionsInKindTest is V4TestBase {
         assertEq(_liquidity(memeId), memeLiq - memeLiq / 4);
     }
 
-    /// (j) A token that lies in `balanceOf` makes the harvest delta absurd. The first exit
-    /// records it; the second would overflow the bookkeeping. Because bookkeeping happens
-    /// inside the gas-capped self-call, that only skips the liar's slice: the exit itself
-    /// never reverts and every other position still pays out.
-    function test_lyingBalanceOfCannotBrickExit() public {
+    /// (j) A token that lies in `balanceOf` (reporting an absurd delta) cannot inflate
+    /// what the vault credits: harvested fees are capped by the PoolManager's own fee
+    /// math, and principal by the pool formula. Exits keep working for every position.
+    function test_lyingBalanceOfIsCappedByPoolMath() public {
         MockLyingERC20 liar = new MockLyingERC20();
         PoolKey memory lk = _initPool(address(liar));
-        (uint256 liarId,) = _openIn(lk, 1_000e6);
+        (uint256 liarId, uint128 liarLiq) = _openIn(lk, 1_000e6);
 
         _swapIn(lk, address(liar), 100e6, 0);
         liar.arm(address(harness));
         harness.inKindExit(1, 100, receiver);
-        assertEq(harness.harvested(address(liar)), type(uint256).max);
+        // 0.3% of 100e6, not type(uint256).max.
+        assertApproxEqAbs(harness.harvested(address(liar)), 300_000, 2);
 
         _swapIn(lk, address(liar), 100e6, 0);
         liar.arm(address(harness));
         uint128 memeBefore = _liquidity(memeId);
         uint128 liarBefore = _liquidity(liarId);
-        vm.expectEmit(true, false, false, false, address(harness));
-        emit SliceSkipped(liarId);
         harness.inKindExit(1, 100, receiver);
+        assertApproxEqAbs(harness.harvested(address(liar)), 600_000, 4);
         assertEq(_liquidity(memeId), memeBefore - memeBefore / 100);
-        assertEq(_liquidity(liarId), liarBefore); // liar slice skipped, position untouched
+        assertEq(_liquidity(liarId), liarBefore - liarBefore / 100);
+        assertLt(_liquidity(liarId), liarLiq);
+    }
+
+    /// (j2) Blocked receiver + lying token: the IOU is capped by the pool formula too.
+    function test_lyingBalanceOfIouIsCapped() public {
+        MockLyingERC20 liar = new MockLyingERC20();
+        PoolKey memory lk = _initPool(address(liar));
+        (uint256 liarId,) = _openIn(lk, 1_000e6);
+        (uint256 v0, uint256 v1) = harness.positionAmounts(liarId);
+        uint256 vLiar = lk.currency0 == address(liar) ? v0 : v1;
+        liar.setBlocked(receiver, true);
+        liar.arm(address(harness));
+
+        harness.inKindExit(1, 4, receiver);
+
+        assertApproxEqAbs(harness.owed(receiver, address(liar)), vLiar / 4, 2);
+        assertLe(harness.owed(receiver, address(liar)), vLiar / 4);
     }
 
     /// (k) Receivers that would swallow a slice are rejected up front.

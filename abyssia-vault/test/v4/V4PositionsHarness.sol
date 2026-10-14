@@ -75,18 +75,20 @@ contract V4PositionsHarness {
         external
         returns (uint256, uint256, uint256, uint256)
     {
-        return V4Positions.withdraw(s, posm, tokenId, liquidity, 0, 0, block.timestamp, recipient);
+        return V4Positions.withdraw(s, posm, stateView, tokenId, liquidity, 0, 0, block.timestamp, recipient);
     }
 
     function withdrawWithMins(uint256 tokenId, uint128 liquidity, uint256 min0, uint256 min1)
         external
         returns (uint256, uint256, uint256, uint256)
     {
-        return V4Positions.withdraw(s, posm, tokenId, liquidity, min0, min1, block.timestamp, address(this));
+        return V4Positions.withdraw(
+            s, posm, stateView, tokenId, liquidity, min0, min1, block.timestamp, address(this)
+        );
     }
 
     function collectFees(uint256 tokenId) external returns (uint256, uint256) {
-        return V4Positions.collectFees(s, posm, tokenId, block.timestamp);
+        return V4Positions.collectFees(s, posm, stateView, tokenId, block.timestamp);
     }
 
     function close(uint256 tokenId) external {
@@ -178,8 +180,9 @@ contract V4PositionsHarness {
             _exitBinding() != keccak256(abi.encode(shares, supply, receiver))
                 || (recipient != receiver && recipient != address(this))
         ) revert UnboundSlice();
-        (fee0, fee1, got0, got1) =
-            V4Positions.withdrawSlice(s, posm, tokenId, shares, supply, recipient, block.timestamp);
+        (fee0, fee1, got0, got1) = V4Positions.withdrawSlice(
+            s, posm, stateView, tokenId, shares, supply, recipient, block.timestamp
+        );
         (PoolKey memory key,) = posm.getPoolAndPositionInfo(tokenId);
         _recordHarvest(key, fee0, fee1);
         if (recipient == address(this)) {
