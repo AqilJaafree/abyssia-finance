@@ -36,7 +36,10 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// against. A v3 pool's reference is its TWAP. Hookless v4 pools have no TWAP, so theirs is
 /// a posted reference tick (`postReferenceTick`): the guardian sets the first, then the
 /// keeper or guardian may move it at most maxTwapDeviation ticks per twapWindow, so a
-/// compromised keeper can only walk it, and the price it trades at, that fast. An honest
+/// compromised keeper can only walk it, and the price it trades at, that fast. The
+/// guardian re-anchors it within maxRebalanceTickDeviation of spot at any time, so the
+/// guardian is a price-setter too: it must post fair ticks from off-chain prices through
+/// private submission, never a spot tick read just before posting. An honest
 /// keeper's exposure is the tick band (~1%). Run the keeper with private transaction
 /// submission and off-chain fair prices (its expected settlement price must come from those,
 /// never from this vault's own `sharePrice()` read just before settling, which would undo
