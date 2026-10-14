@@ -86,7 +86,7 @@ contract AbyssiaDeploySepoliaTest is Test {
         assertTrue(d.factory.hasRole(admin, address(d.timelock)));
         assertFalse(d.factory.hasRole(admin, actor));
         assertFalse(d.factory.hasRole(d.factory.DEPLOYER_ROLE(), actor));
-        // Only the timelock deploys vaults (the factory doesn't check constructor args).
+        // Only the timelock deploys vaults, each from a timelocked init-hash approval.
         assertTrue(d.factory.hasRole(d.factory.DEPLOYER_ROLE(), address(d.timelock)));
         assertFalse(d.factory.hasRole(d.factory.DEPLOYER_ROLE(), proposer));
         assertTrue(d.factory.hasRole(d.factory.GUARDIAN_ROLE(), guardian));

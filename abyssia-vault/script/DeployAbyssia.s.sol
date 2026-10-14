@@ -19,7 +19,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 /// @notice Deploys one Abyssia memecoin vault and its governance:
 ///  1. TimelockController (`PROPOSER` proposes and executes; the guardian may cancel);
 ///  2. VaultRegistry, with the memecoin class and (optionally) one token's v3 + v4 pools;
-///  3. AbyssiaVaultFactory, approving this build's vault code hash;
+///  3. AbyssiaVaultFactory, approving this one vault's init hash (code and arguments);
 ///  4. AbyssiaVault through the factory, with its treasury;
 ///  5. hands every admin role to the timelock and renounces the deployer's.
 /// Every setting comes from the environment with no defaults (see .env.example); Uniswap
@@ -165,12 +165,13 @@ contract DeployAbyssia is Script {
                 );
         }
 
-        // 3-4. Factory approving this build's vault code, and the vault through it.
+        // 3-4. Factory approving this vault's code and arguments, and the vault through it.
         d.factory = new AbyssiaVaultFactory(actor, actor);
         d.factory.grantRole(d.factory.GUARDIAN_ROLE(), s.guardian);
         bytes memory code = type(AbyssiaVault).creationCode;
-        d.factory.setCodeApproved(keccak256(code), true);
-        d.vault = AbyssiaVault(d.factory.deploy(code, abi.encode(_config(n, s, d.registry, actor)), s.salt));
+        bytes memory args = abi.encode(_config(n, s, d.registry, actor));
+        d.factory.setInitApproved(keccak256(abi.encodePacked(code, args)), true);
+        d.vault = AbyssiaVault(d.factory.deploy(code, args, s.salt));
         d.vault.setTreasury(s.treasury);
 
         // 5. Handover: the timelock administers everything; the deployer keeps nothing.
@@ -179,8 +180,8 @@ contract DeployAbyssia is Script {
         d.registry.renounceRole(admin, actor);
         d.vault.grantRole(admin, address(d.timelock));
         d.vault.renounceRole(admin, actor);
-        // Constructor args are not checked by the factory, so only the timelock may deploy:
-        // every new vault is a delayed proposal the guardian can cancel.
+        // Only the timelock deploys, on top of the timelocked per-vault approval: every new
+        // vault is a delayed proposal the guardian can cancel.
         d.factory.grantRole(d.factory.DEPLOYER_ROLE(), address(d.timelock));
         d.factory.renounceRole(d.factory.DEPLOYER_ROLE(), actor);
         d.factory.grantRole(admin, address(d.timelock));
