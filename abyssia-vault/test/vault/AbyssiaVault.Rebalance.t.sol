@@ -248,11 +248,11 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         VaultRebalance.Args memory a =
             _rebalanceArgs(v3PoolId, _spec(Shapes.SPOT, Shapes.USDC_ONLY, 1, 60), 1e6, 0);
         vm.prank(keeper);
-        vm.expectPartialRevert(PoolOracle.PriceOffTwap.selector);
+        vm.expectPartialRevert(VaultBook.PriceOffReference.selector);
         vault.rebalance(a);
         uint256 minOut = _floor(v3PoolId, true, 1e6);
         vm.prank(keeper);
-        vm.expectPartialRevert(PoolOracle.PriceOffTwap.selector);
+        vm.expectPartialRevert(VaultBook.PriceOffReference.selector);
         vault.swap(v3PoolId, true, 1e6, minOut);
     }
 

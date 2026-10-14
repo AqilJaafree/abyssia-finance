@@ -83,6 +83,7 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         // Fixture: test pools reserve 64 observations (production default is 1,200).
         vm.prank(admin);
         vault.setMinObservations(64);
+        _postReference(v4PoolId, 0);
         // Let the v3 pools' TWAP window fill (the vault's v3 swaps and rebalances need it).
         vm.warp(block.timestamp + vault.twapWindow());
     }
@@ -154,6 +155,7 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         lp.open(V4Positions.OpenParams(key, -FULL, FULL, 1e12, 1e12, 0, 0, block.timestamp));
         vm.prank(admin);
         poolId = registry.addV4Pool(key, MEMECOIN);
+        if (address(vault) != address(0)) _postReference(poolId, 0);
     }
 
     function _initV4(address token, address hooks) internal returns (PoolKey memory key) {
@@ -285,6 +287,26 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
             zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
             trader
         );
+    }
+
+    /// @dev The guardian posts a v4 pool's first reference tick.
+    function _postReference(bytes32 poolId, int24 tick) internal {
+        vm.prank(guardian);
+        vault.postReferenceTick(poolId, tick);
+    }
+
+    /// @dev The keeper walks a v4 pool's reference tick to `target`: maxTwapDeviation ticks
+    /// per post, one post per twapWindow.
+    function _walkReference(bytes32 poolId, int24 target) internal {
+        int24 step = vault.maxTwapDeviation();
+        int24 ref = vault.referenceTick(poolId).tick;
+        while (ref != target) {
+            vm.warp(block.timestamp + vault.twapWindow());
+            if (target > ref) ref = target - ref > step ? ref + step : target;
+            else ref = ref - target > step ? ref - step : target;
+            vm.prank(keeper);
+            vault.postReferenceTick(poolId, ref);
+        }
     }
 
     function _expectUnauthorized(address account, bytes32 role) internal {

@@ -7,7 +7,6 @@ import {V4Positions} from "../v4/V4Positions.sol";
 import {VaultBook} from "./VaultBook.sol";
 import {VaultOps} from "./VaultOps.sol";
 import {Shapes} from "./Shapes.sol";
-import {PoolOracle} from "./PoolOracle.sol";
 
 /// @title VaultRebalance
 /// @notice Atomic per-pool rebalancing into a liquidity shape, and the verified stop-loss,
@@ -29,7 +28,7 @@ library VaultRebalance {
     struct Limits {
         int24 maxTickDeviation; // current tick vs Args.expectedTick
         uint32 twapWindow; // v3 only
-        int24 maxTwapDeviation; // v3 only: current tick vs TWAP
+        int24 maxTwapDeviation; // current tick vs the reference (v3 TWAP, v4 posted tick)
         uint16 minObservations; // v3 only: the pool's observation capacity floor
     }
 
@@ -48,7 +47,8 @@ library VaultRebalance {
     /// vault, NFTs burned), then open `a.spec` from `a.usdcAmount` USDC and `a.tokenAmount`
     /// of the token. Enforces the class's allowed shapes, max ranges, range width (per
     /// range, via VaultOps.open) and rebalance cooldown; the pool's current tick must be
-    /// within `l.maxTickDeviation` of `a.expectedTick` and, for v3, near its TWAP.
+    /// within `l.maxTickDeviation` of `a.expectedTick` and near its reference (v3: TWAP;
+    /// v4: the posted reference tick).
     /// @param idle the vault's idle USDC before the call
     /// @return usdcIn USDC the unwind returned (credit it to idle)
     /// @return usdcSpent USDC the new ranges took (debit it from idle)
@@ -68,7 +68,7 @@ library VaultRebalance {
         if (last != 0 && block.timestamp < last + x.params.rebalanceCooldown) {
             revert CooldownActive(last + x.params.rebalanceCooldown);
         }
-        int24 tick = _checkPrice(e, m, a, l);
+        int24 tick = _checkPrice(b, e, m, a, l);
 
         usdcIn = _unwind(b, e, a.poolId);
         if (a.tokenAmount == type(uint256).max) a.tokenAmount = b.tokenBalance[m.token];
@@ -119,18 +119,21 @@ library VaultRebalance {
         emit StopLossTriggered(poolId, entry, value);
     }
 
-    /// @dev The pool's tick, after checking it against the keeper's expectation and (v3) the TWAP.
-    function _checkPrice(VaultBook.Env memory e, VaultBook.PoolMeta memory m, Args memory a, Limits memory l)
-        private
-        view
-        returns (int24 tick)
-    {
+    /// @dev The pool's tick, after checking it against the keeper's expectation and the
+    /// pool's reference.
+    function _checkPrice(
+        VaultBook.Book storage b,
+        VaultBook.Env memory e,
+        VaultBook.PoolMeta memory m,
+        Args memory a,
+        Limits memory l
+    ) private view returns (int24 tick) {
         tick = VaultBook.currentTick(m, e.stateView, a.poolId);
         int24 dev = tick > a.expectedTick ? tick - a.expectedTick : a.expectedTick - tick;
         if (dev > l.maxTickDeviation) revert TickNotAsExpected(tick, a.expectedTick);
-        if (m.protocol == VaultBook.Protocol.V3) {
-            PoolOracle.requireNearTwap(m.v3Pool, l.twapWindow, l.maxTwapDeviation, l.minObservations);
-        }
+        VaultBook.requireNearReference(
+            b, m, a.poolId, tick, l.twapWindow, l.maxTwapDeviation, l.minObservations
+        );
     }
 
     /// @dev Nothing to deploy; or the range containing the price is missing one token, so it

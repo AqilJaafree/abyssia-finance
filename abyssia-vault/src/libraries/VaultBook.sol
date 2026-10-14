@@ -5,6 +5,8 @@ import {VaultRegistry} from "../registry/VaultRegistry.sol";
 import {V3Positions} from "../v3/V3Positions.sol";
 import {V4Positions} from "../v4/V4Positions.sol";
 import {PoolPrice} from "./PoolPrice.sol";
+import {PoolOracle} from "./PoolOracle.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {INonfungiblePositionManager as INPM} from "../interfaces/INonfungiblePositionManager.sol";
 import {IV4PositionManager} from "../interfaces/IV4PositionManager.sol";
 import {IStateView} from "../interfaces/IStateView.sol";
@@ -54,6 +56,14 @@ library VaultBook {
         /// USDC value of a pool's positions right after its last rebalance (stop-loss basis).
         mapping(bytes32 poolId => uint256) entryValue;
         mapping(bytes32 poolId => uint256) lastRebalance;
+        /// v4 pools: the posted reference tick (v3 pools use their TWAP).
+        mapping(bytes32 poolId => ReferenceTick) referenceTick;
+    }
+
+    struct ReferenceTick {
+        int24 tick;
+        uint40 updatedAt;
+        bool set;
     }
 
     /// @dev The vault's fixed external dependencies.
@@ -75,6 +85,13 @@ library VaultBook {
     error WidthOutOfBounds(int24 width);
     error PoolTooThin(uint128 liquidity, uint128 minLiquidity);
     error AllocationExceeded(uint256 value, uint256 limit);
+    error NoReferencePrice(bytes32 poolId);
+    error PriceOffReference(int24 tick, int24 referenceTick);
+    error ReferenceTooSoon(uint256 nextAllowed);
+    error ReferenceStepTooLarge(int24 from, int24 to);
+    error InvalidReference(bytes32 poolId, int24 tick);
+
+    event ReferenceTickPosted(bytes32 indexed poolId, int24 tick);
 
     // ---------------------------------------------------------------------
     // Pool metadata and checks
@@ -170,6 +187,72 @@ library VaultBook {
         if (poolValue > poolLimit) revert AllocationExceeded(poolValue, poolLimit);
         uint256 classLimit = nav * cp.maxClassBps / BPS;
         if (classValue > classLimit) revert AllocationExceeded(classValue, classLimit);
+    }
+
+    // ---------------------------------------------------------------------
+    // Reference prices
+    // ---------------------------------------------------------------------
+
+    /// @notice Post a hookless v4 pool's reference tick. The first post needs `canSet` (the
+    /// guardian); after that each post may move it at most `maxStep` ticks, at most once per
+    /// `interval` seconds.
+    function postReferenceTick(
+        Book storage b,
+        VaultRegistry registry,
+        bytes32 poolId,
+        int24 tick,
+        bool canSet,
+        uint32 interval,
+        int24 maxStep
+    ) external {
+        PoolMeta memory m = meta(b, registry, poolId);
+        if (m.protocol != Protocol.V4 || tick < TickMath.MIN_TICK || tick > TickMath.MAX_TICK) {
+            revert InvalidReference(poolId, tick);
+        }
+        ReferenceTick storage r = b.referenceTick[poolId];
+        if (r.set) {
+            uint256 next = uint256(r.updatedAt) + interval;
+            if (block.timestamp < next) revert ReferenceTooSoon(next);
+            int24 step = tick > r.tick ? tick - r.tick : r.tick - tick;
+            if (step > maxStep) revert ReferenceStepTooLarge(r.tick, tick);
+        } else if (!canSet) {
+            revert NoReferencePrice(poolId);
+        }
+        (r.tick, r.updatedAt, r.set) = (tick, uint40(block.timestamp), true);
+        emit ReferenceTickPosted(poolId, tick);
+    }
+
+    /// @notice The tick a pool's price is checked against: a v3 pool's TWAP over `window`
+    /// (with at least `minObservations` capacity), a v4 pool's posted reference tick.
+    function referenceTick(
+        Book storage b,
+        PoolMeta memory m,
+        bytes32 poolId,
+        uint32 window,
+        uint16 minObservations
+    ) internal view returns (int24) {
+        if (m.protocol == Protocol.V3) {
+            return PoolOracle.checkedTwapTick(m.v3Pool, window, minObservations);
+        }
+        ReferenceTick memory r = b.referenceTick[poolId];
+        if (!r.set) revert NoReferencePrice(poolId);
+        return r.tick;
+    }
+
+    /// @notice Revert unless `tick` is within `maxDeviation` ticks of the pool's reference
+    /// tick (1 tick ~ 0.01% in price).
+    function requireNearReference(
+        Book storage b,
+        PoolMeta memory m,
+        bytes32 poolId,
+        int24 tick,
+        uint32 window,
+        int24 maxDeviation,
+        uint16 minObservations
+    ) internal view {
+        int24 ref = referenceTick(b, m, poolId, window, minObservations);
+        int24 dev = tick > ref ? tick - ref : ref - tick;
+        if (dev > maxDeviation) revert PriceOffReference(tick, ref);
     }
 
     // ---------------------------------------------------------------------

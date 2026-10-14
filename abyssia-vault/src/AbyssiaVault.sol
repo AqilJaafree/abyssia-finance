@@ -29,17 +29,18 @@ import {ISwapRouter02} from "./interfaces/ISwapRouter02.sol";
 /// the registry's class limits, only in hookless v4 pools, and never sending assets
 /// anywhere but the vault. The keeper or guardian can trigger a verified stop-loss.
 /// TRUST: the keeper is trusted within these bounds, not beyond them. Price guards (the
-/// rebalance tick band, v3 TWAP checks, the swap floor) bound how far a pool's price can be
-/// pushed around a keeper action, but within them a compromised keeper colluding with
-/// someone who moves a price can still trade at that price (up to the pool's allocation),
-/// and the keeper picks the expected price each settlement is checked against. Hookless v4
-/// pools have no TWAP, so a v4 rebalance is bounded only by the keeper's own expected tick:
-/// measured at 100k NAV with a 30% pool cap, a compromised keeper plus a colluding price
-/// mover lost ~2.9% of NAV at a ~49% push and up to ~16.6% of NAV (57% of the deployed
-/// amount) at an extreme push in one transaction, versus ~0.8% of NAV in a v3 pool, where
-/// the TWAP caps the push. An honest keeper's exposure is the tick band (~1%). Run the keeper with private transaction submission and off-chain
-/// fair prices (its expected settlement price must come from those, never from this vault's
-/// own `sharePrice()` read just before settling, which would undo the protection).
+/// rebalance tick band, the reference-price check, the swap floor) bound how far a pool's
+/// price can be pushed around a keeper action, but within them a compromised keeper
+/// colluding with someone who moves a price can still trade at that price (up to the
+/// pool's allocation), and the keeper picks the expected price each settlement is checked
+/// against. A v3 pool's reference is its TWAP. Hookless v4 pools have no TWAP, so theirs is
+/// a posted reference tick (`postReferenceTick`): the guardian sets the first, then the
+/// keeper or guardian may move it at most maxTwapDeviation ticks per twapWindow, so a
+/// compromised keeper can only walk it, and the price it trades at, that fast. An honest
+/// keeper's exposure is the tick band (~1%). Run the keeper with private transaction
+/// submission and off-chain fair prices (its expected settlement price must come from those,
+/// never from this vault's own `sharePrice()` read just before settling, which would undo
+/// the protection).
 /// @dev Accounting never takes token balances as truth: idle USDC (`idleAssets`) and token
 /// inventory (`tokenBalance`) are tracked internally, and every credit is the smaller of
 /// the balance delta and the amount Uniswap's own math reports. The book, its checks and
@@ -106,7 +107,7 @@ contract AbyssiaVault is AsyncBatchVault {
     uint32 public twapWindow = 10 minutes;
     int24 public maxTwapDeviation = 500;
     /// @notice Minimum observation capacity a v3 pool must keep for its TWAP to count (see
-    /// PoolOracle.requireNearTwap): about twapWindow / block time, with margin. Raise a
+    /// PoolOracle.checkedTwapTick): about twapWindow / block time, with margin. Raise a
     /// pool's capacity once with `increaseObservationCardinalityNext` before using it.
     uint16 public minObservations = 1_200;
 
@@ -121,6 +122,7 @@ contract AbyssiaVault is AsyncBatchVault {
     );
     event StopLossTriggered(bytes32 indexed poolId, uint256 entryValue, uint256 value);
     event TokenSurplusSwept(address indexed token, address indexed to, uint256 surplus);
+    event ReferenceTickPosted(bytes32 indexed poolId, int24 tick);
     // Library events and errors, re-declared so indexers and clients can decode them from
     // the vault's ABI.
     event PositionOpened(
@@ -175,7 +177,11 @@ contract AbyssiaVault is AsyncBatchVault {
     error NoEntryValue(bytes32 poolId);
     error StopLossNotReached(uint256 value, uint256 trigger);
     error TwapUnavailable(address pool, uint32 window);
-    error PriceOffTwap(int24 tick, int24 twapTick);
+    error PriceOffReference(int24 tick, int24 referenceTick);
+    error NoReferencePrice(bytes32 poolId);
+    error ReferenceTooSoon(uint256 nextAllowed);
+    error ReferenceStepTooLarge(int24 from, int24 to);
+    error InvalidReference(bytes32 poolId, int24 tick);
     error ObservationCapacityTooLow(address pool, uint16 capacity, uint16 required);
     error InvalidShape();
     error InvalidSide();
@@ -239,6 +245,19 @@ contract AbyssiaVault is AsyncBatchVault {
         _increaseIdle(usdcIn);
         _decreaseIdle(usdcSpent);
         VaultBook.checkAllocation(_book, _env(), a.poolId, x.cls, x.params, totalAssets());
+    }
+
+    /// @notice Keeper or guardian: post a hookless v4 pool's reference tick, which its price
+    /// must stay within maxTwapDeviation of for keeper rebalances and swaps, and which values
+    /// the stop-loss (a v3 pool's TWAP plays this role). Only the guardian can post the
+    /// first one; after that each post may move it at most maxTwapDeviation ticks, at most
+    /// once per twapWindow.
+    function postReferenceTick(bytes32 poolId, int24 tick) external {
+        bool guardian = hasRole(GUARDIAN_ROLE, msg.sender);
+        if (!guardian && !hasRole(KEEPER_ROLE, msg.sender)) {
+            revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
+        }
+        VaultBook.postReferenceTick(_book, registry, poolId, tick, guardian, twapWindow, maxTwapDeviation);
     }
 
     /// @notice Keeper or guardian: pull all liquidity out of `poolId` into the vault (no
@@ -438,6 +457,11 @@ contract AbyssiaVault is AsyncBatchVault {
             _book.lastRebalance[poolId],
             VaultBook.poolPositionsValue(_book, _env(), poolId)
         );
+    }
+
+    /// @notice A v4 pool's posted reference tick.
+    function referenceTick(bytes32 poolId) external view returns (VaultBook.ReferenceTick memory) {
+        return _book.referenceTick[poolId];
     }
 
     function inventoryTokens() external view returns (address[] memory) {

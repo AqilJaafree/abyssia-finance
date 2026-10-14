@@ -9,7 +9,6 @@ import {V4Positions} from "../v4/V4Positions.sol";
 import {VaultBook} from "./VaultBook.sol";
 import {VaultSwaps} from "./VaultSwaps.sol";
 import {PoolPrice} from "./PoolPrice.sol";
-import {PoolOracle} from "./PoolOracle.sol";
 
 /// @title VaultOps
 /// @notice The vault's position, swap and inventory operations, as an EXTERNAL library
@@ -240,8 +239,9 @@ library VaultOps {
 
     /// @notice Exact-input swap between USDC and a pool's token in that pool. USDC -> token
     /// needs a usable pool and at most `idle` USDC; `minOut` must be at least the amount
-    /// at the pool's current price minus `a.maxSlippageBps`; in v3 pools the price must be
-    /// within `a.maxTwapDeviation` ticks of its `a.twapWindow` TWAP.
+    /// at the pool's current price minus `a.maxSlippageBps`; the price must be within
+    /// `a.maxTwapDeviation` ticks of the pool's reference (v3: its `a.twapWindow` TWAP; v4:
+    /// the posted reference tick).
     /// @return paid input spent (USDC: debit it from idle)
     /// @return out output received (USDC: credit it to idle)
     /// @return x the pool's class (USDC -> token only), for the allocation check
@@ -258,10 +258,16 @@ library VaultOps {
             VaultBook.requireHookless(m, a.poolId);
             _requireInventory(b, m.token, a.amountIn);
         }
-        // v3 pools: the price must also be near its TWAP (hookless v4 pools have no oracle).
-        if (m.protocol == VaultBook.Protocol.V3) {
-            PoolOracle.requireNearTwap(m.v3Pool, a.twapWindow, a.maxTwapDeviation, a.minObservations);
-        }
+        // The price must be near the pool's reference (v3: TWAP; v4: the posted tick).
+        VaultBook.requireNearReference(
+            b,
+            m,
+            a.poolId,
+            VaultBook.currentTick(m, e.stateView, a.poolId),
+            a.twapWindow,
+            a.maxTwapDeviation,
+            a.minObservations
+        );
         uint160 sqrtP = VaultBook.sqrtPrice(m, e.stateView, a.poolId);
         uint256 atPrice = a.usdcIn
             ? PoolPrice.usdcToToken(a.amountIn, sqrtP, m.usdcIsToken0)
