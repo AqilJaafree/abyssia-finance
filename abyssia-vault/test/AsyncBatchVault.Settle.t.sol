@@ -16,6 +16,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
     function test_priceMoveBeyondGuardReverts() public {
         _depositAndClaim(alice, 100 * USDC);
         _gain(50 * USDC); // +50%, guard is 20%
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
@@ -25,6 +26,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
     function test_priceDropBeyondGuardReverts() public {
         _depositAndClaim(alice, 100 * USDC);
         _halveNav(); // -50%
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
@@ -48,6 +50,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
     }
 
     function _settleGas() internal returns (uint256 used) {
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         uint256 gasBefore = gasleft();
@@ -73,5 +76,32 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
         assertLt(gasN, 175_000);
         (, uint128 depositShares,,,) = vault.batches(3);
         assertEq(depositShares, 50e12);
+    }
+
+    /// A keeper can't settle twice within minSettleInterval (walking lastSharePrice).
+    function test_settleTooSoonReverts() public {
+        _depositAndClaim(alice, 100 * USDC); // settles at t
+        uint256 next = vault.lastSettleTime() + vault.minSettleInterval();
+        uint256 price = vault.sharePrice();
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.SettledTooRecently.selector, next));
+        vault.settle(price);
+        vm.warp(next);
+        vm.prank(keeper);
+        vault.settle(price);
+        assertEq(vault.lastSettleTime(), next);
+    }
+
+    function test_minSettleIntervalAdminCapped() public {
+        assertEq(vault.minSettleInterval(), 60);
+        vm.startPrank(admin);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setMinSettleInterval(1 hours + 1);
+        vault.setMinSettleInterval(0);
+        vm.stopPrank();
+        assertEq(vault.minSettleInterval(), 0);
+        _expectUnauthorized(guardian, vault.DEFAULT_ADMIN_ROLE());
+        vm.prank(guardian);
+        vault.setMinSettleInterval(10);
     }
 }

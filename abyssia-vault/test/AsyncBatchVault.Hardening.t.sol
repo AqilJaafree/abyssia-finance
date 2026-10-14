@@ -82,6 +82,7 @@ contract AsyncBatchVaultHardeningTest is VaultTestBase {
     function test_guardianOverrideWithinTolerance() public {
         _depositAndClaim(alice, 100 * USDC);
         _halveNav();
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 live = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceMoveTooLarge.selector, 1e6, live));
@@ -95,6 +96,7 @@ contract AsyncBatchVaultHardeningTest is VaultTestBase {
     function test_guardianOverrideOutsideToleranceReverts() public {
         _depositAndClaim(alice, 100 * USDC);
         _halveNav();
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 live = vault.sharePrice();
         vm.prank(guardian);
         vm.expectRevert(abi.encodeWithSelector(AsyncBatchVault.PriceNotAsExpected.selector, 0.6e6, live));

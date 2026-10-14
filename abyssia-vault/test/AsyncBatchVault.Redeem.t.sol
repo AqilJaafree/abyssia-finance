@@ -79,6 +79,7 @@ contract AsyncBatchVaultRedeemTest is VaultTestBase {
         deal(address(usdc), address(vault), 10 * USDC);
         vm.prank(alice);
         vault.requestRedeem(shares);
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vm.expectRevert(

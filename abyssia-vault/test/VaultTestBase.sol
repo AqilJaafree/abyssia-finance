@@ -52,7 +52,9 @@ abstract contract VaultTestBase is Test {
         );
     }
 
+    /// @dev Moves time past the minimum settle interval, then settles at the live price.
     function _settle() internal {
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vault.settle(price);

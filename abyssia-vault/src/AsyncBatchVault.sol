@@ -32,6 +32,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public constant MAX_CYCLE_MOVE_BPS_CAP = 5_000; // 50%
     /// @dev Hard cap on how far the live share price may sit from the keeper's expected price.
     uint256 public constant MAX_SETTLE_TOLERANCE_BPS = 200; // 2%
+    /// @dev Hard cap on the minimum time between keeper settlements.
+    uint256 public constant MAX_MIN_SETTLE_INTERVAL = 1 hours;
 
     struct Batch {
         uint128 depositAssets; // USDC requested for deposit in this batch
@@ -62,6 +64,11 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @notice The keeper's `settle(expectedPrice)` reverts unless the live share price is
     /// within this many bps of `expectedPrice`.
     uint256 public settleToleranceBps = 50;
+    /// @notice Minimum seconds between two keeper settlements, so a compromised keeper can't
+    /// walk `lastSharePrice` by maxCycleMoveBps many times in quick succession.
+    uint256 public minSettleInterval = 60;
+    /// @notice Timestamp of the last settlement (0 before the first).
+    uint256 public lastSettleTime;
     /// @notice ERC-7540 operators: `operator` may cancel and claim on behalf of `controller`
     /// (and choose the receiver), so approving one is full trust over those requests.
     mapping(address controller => mapping(address operator => bool)) public isOperator;
@@ -85,6 +92,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     event MaxTotalAssetsSet(uint256 value);
     event MaxCycleMoveBpsSet(uint256 value);
     event SettleToleranceBpsSet(uint256 value);
+    event MinSettleIntervalSet(uint256 value);
     event SurplusSwept(address indexed to, uint256 surplus);
     event OperatorSet(address indexed controller, address indexed operator, bool approved);
 
@@ -105,6 +113,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     error SharesToVaultNotAllowed();
     error NotOperator(address controller, address caller);
     error InvalidOperator();
+    error SettledTooRecently(uint256 nextAllowed);
 
     constructor(
         IERC20 asset_,
@@ -286,6 +295,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// may add a pre-settlement cancel cutoff).
     function settle(uint256 expectedPrice) external onlyRole(KEEPER_ROLE) {
         if (expectedPrice == 0) revert ParamOutOfBounds();
+        uint256 next = lastSettleTime + minSettleInterval;
+        if (lastSettleTime != 0 && block.timestamp < next) revert SettledTooRecently(next);
         _settle(false, expectedPrice, settleToleranceBps);
     }
 
@@ -349,6 +360,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         b.redeemAssets = redeemAssets.toUint128();
         b.settled = true;
         lastSharePrice = price;
+        lastSettleTime = block.timestamp;
         currentBatchId = id + 1;
 
         emit BatchSettled(id, price, b.depositAssets, depositShares, b.redeemShares, redeemAssets);
@@ -483,6 +495,12 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         if (value == 0 || value > MAX_SETTLE_TOLERANCE_BPS) revert ParamOutOfBounds();
         settleToleranceBps = value;
         emit SettleToleranceBpsSet(value);
+    }
+
+    function setMinSettleInterval(uint256 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (value > MAX_MIN_SETTLE_INTERVAL) revert ParamOutOfBounds();
+        minSettleInterval = value;
+        emit MinSettleIntervalSet(value);
     }
 
     /// @notice Guardian may only tighten the keeper's settle tolerance, instantly.
