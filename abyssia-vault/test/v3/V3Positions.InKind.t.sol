@@ -9,6 +9,7 @@ import {IUniswapV3Pool} from "../../src/interfaces/IUniswapV3Pool.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockFreezableERC20} from "../mocks/MockFreezableERC20.sol";
 import {MockGasBurnerERC20} from "../mocks/MockGasBurnerERC20.sol";
+import {MockLyingERC20} from "../mocks/MockLyingERC20.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 /// @dev The per-position in-kind exit pattern (harness `inKindExit`) against tokens
@@ -290,5 +291,38 @@ contract V3PositionsInKindTest is V3TestBase {
         // Every slice really executed.
         assertGt(usdc.balanceOf(receiver), 0);
         assertEq(_liquidity(memeId), memeLiq - memeLiq / 4);
+    }
+
+    /// (j) Blocked receiver + a token that lies in `balanceOf`: the IOU delta is absurd.
+    /// The first exit records it; the second would overflow the bookkeeping. Because the
+    /// IOU is recorded inside the gas-capped self-call, that only skips the liar's slice:
+    /// the exit itself never reverts and every other position still pays out.
+    function test_lyingBalanceOfCannotBrickExit() public {
+        MockLyingERC20 liar = new MockLyingERC20();
+        (uint256 liarId,) = _openUsdcPool(address(liar), 1_000e6);
+        liar.setBlocked(receiver, true);
+
+        liar.arm(address(harness));
+        harness.inKindExit(1, 100, receiver);
+        assertEq(harness.owedTotal(address(liar)), type(uint256).max);
+
+        liar.arm(address(harness));
+        uint128 memeBefore = _liquidity(memeId);
+        uint128 liarBefore = _liquidity(liarId);
+        vm.expectEmit(true, false, false, false, address(harness));
+        emit SliceSkipped(liarId);
+        harness.inKindExit(1, 100, receiver);
+        assertEq(_liquidity(memeId), memeBefore - memeBefore / 100);
+        assertEq(_liquidity(liarId), liarBefore);
+    }
+
+    /// (k) Receivers that would swallow a slice are rejected up front.
+    function test_invalidReceiversRejected() public {
+        address[3] memory bad = [address(0), address(harness), address(npm)];
+        for (uint256 i = 0; i < bad.length; i++) {
+            vm.expectRevert(V3PositionsHarness.InvalidReceiver.selector);
+            harness.inKindExit(1, 4, bad[i]);
+        }
+        assertEq(_liquidity(memeId), memeLiq);
     }
 }

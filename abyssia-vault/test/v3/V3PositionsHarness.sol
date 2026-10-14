@@ -48,6 +48,7 @@ contract V3PositionsHarness {
     error UnboundSlice();
     error ExitInProgress();
     error InsufficientGasForSlice();
+    error InvalidReceiver();
 
     constructor(INPM npm_) {
         npm = npm_;
@@ -88,6 +89,10 @@ contract V3PositionsHarness {
     /// the position and emit SliceSkipped.
     /// @param supply total share supply BEFORE the exiting shares were burned.
     function inKindExit(uint256 shares, uint256 supply, address receiver) external {
+        // A slice sent to the vault itself would land with no IOU (lost to the holder).
+        if (receiver == address(0) || receiver == address(this) || receiver == address(npm)) {
+            revert InvalidReceiver();
+        }
         // No nested exit (a token callback re-entering here would clobber the binding).
         if (_exitBinding() != bytes32(0)) revert ExitInProgress();
         EXIT_BINDING.asBytes32().tstore(keccak256(abi.encode(shares, supply, receiver)));
@@ -111,13 +116,10 @@ contract V3PositionsHarness {
             return;
         }
         _requireSliceGas();
-        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, address(this)) returns (
-            uint256 got0, uint256 got1
-        ) {
-            (,, address token0, address token1,,,,,,,,) = npm.positions(tokenId);
-            _recordOwed(receiver, token0, got0);
-            _recordOwed(receiver, token1, got1);
-        } catch {
+        // The IOU is recorded inside sliceTo: an overflow from an absurd token-reported
+        // delta then only fails this attempt, never the whole exit.
+        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, address(this)) {}
+        catch {
             emit SliceSkipped(tokenId);
         }
     }
@@ -141,8 +143,9 @@ contract V3PositionsHarness {
     /// slice can only go to that receiver or to this contract (the IOU fallback).
     /// When `recipient == address(this)` it returns this contract's BALANCE DELTA per
     /// token (not the position manager's reported amounts), so fee-on-transfer tokens
-    /// cannot over-credit an IOU. Measuring inside this gas-capped frame also keeps the
-    /// untrusted `balanceOf` calls under SLICE_GAS.
+    /// cannot over-credit an IOU, and records that IOU. Measuring and recording inside this
+    /// gas-capped frame keeps the untrusted `balanceOf` calls under SLICE_GAS and lets an
+    /// absurd reported delta fail only this attempt.
     function sliceTo(uint256 tokenId, uint256 shares, uint256 supply, address receiver, address recipient)
         external
         returns (uint256, uint256)
@@ -159,10 +162,11 @@ contract V3PositionsHarness {
         uint256 before0 = IERC20(token0).balanceOf(address(this));
         uint256 before1 = IERC20(token1).balanceOf(address(this));
         V3Positions.withdrawSlice(s, npm, tokenId, shares, supply, recipient, block.timestamp);
-        return (
-            IERC20(token0).balanceOf(address(this)) - before0,
-            IERC20(token1).balanceOf(address(this)) - before1
-        );
+        uint256 got0 = IERC20(token0).balanceOf(address(this)) - before0;
+        uint256 got1 = IERC20(token1).balanceOf(address(this)) - before1;
+        _recordOwed(receiver, token0, got0);
+        _recordOwed(receiver, token1, got1);
+        return (got0, got1);
     }
 
     function claimOwed(address token) external {

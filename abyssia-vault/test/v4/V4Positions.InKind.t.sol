@@ -9,6 +9,7 @@ import {PoolKey} from "../../src/types/PoolKey.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockFreezableERC20} from "../mocks/MockFreezableERC20.sol";
 import {MockGasBurnerERC20} from "../mocks/MockGasBurnerERC20.sol";
+import {MockLyingERC20} from "../mocks/MockLyingERC20.sol";
 
 /// @dev The per-position in-kind exit pattern (harness `inKindExit`) against tokens
 /// that refuse transfers, plus slice validation, tick-boundary valuation and the
@@ -289,5 +290,41 @@ contract V4PositionsInKindTest is V4TestBase {
         // Every slice really executed.
         assertGt(usdc.balanceOf(receiver), 0);
         assertEq(_liquidity(memeId), memeLiq - memeLiq / 4);
+    }
+
+    /// (j) A token that lies in `balanceOf` makes the harvest delta absurd. The first exit
+    /// records it; the second would overflow the bookkeeping. Because bookkeeping happens
+    /// inside the gas-capped self-call, that only skips the liar's slice: the exit itself
+    /// never reverts and every other position still pays out.
+    function test_lyingBalanceOfCannotBrickExit() public {
+        MockLyingERC20 liar = new MockLyingERC20();
+        PoolKey memory lk = _initPool(address(liar));
+        (uint256 liarId,) = _openIn(lk, 1_000e6);
+
+        _swapIn(lk, address(liar), 100e6, 0);
+        liar.arm(address(harness));
+        harness.inKindExit(1, 100, receiver);
+        assertEq(harness.harvested(address(liar)), type(uint256).max);
+
+        _swapIn(lk, address(liar), 100e6, 0);
+        liar.arm(address(harness));
+        uint128 memeBefore = _liquidity(memeId);
+        uint128 liarBefore = _liquidity(liarId);
+        vm.expectEmit(true, false, false, false, address(harness));
+        emit SliceSkipped(liarId);
+        harness.inKindExit(1, 100, receiver);
+        assertEq(_liquidity(memeId), memeBefore - memeBefore / 100);
+        assertEq(_liquidity(liarId), liarBefore); // liar slice skipped, position untouched
+    }
+
+    /// (k) Receivers that would swallow a slice are rejected up front.
+    function test_invalidReceiversRejected() public {
+        address[6] memory bad =
+            [address(0), address(1), address(harness), address(posm), v4.poolManager, v4.permit2];
+        for (uint256 i = 0; i < bad.length; i++) {
+            vm.expectRevert(V4PositionsHarness.InvalidReceiver.selector);
+            harness.inKindExit(1, 4, bad[i]);
+        }
+        assertEq(_liquidity(memeId), memeLiq);
     }
 }

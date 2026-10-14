@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {INonfungiblePositionManager as INPM} from "../interfaces/INonfungiblePositionManager.sol";
@@ -41,7 +42,8 @@ import {IUniswapV3Pool} from "../interfaces/IUniswapV3Pool.sol";
 ///  5. Otherwise retry with `recipient = address(this)` and record an IOU
 ///     `owed[receiver][token] += amount` plus a per-token `owedTotal[token] += amount`,
 ///     where `amount` is the vault's BALANCE DELTA of each token across the withdrawal
-///     (measured inside the gas-capped self-call), never the amounts returned by the
+///     (measured AND recorded inside the gas-capped self-call, so a token reporting an
+///     absurd delta can only fail that attempt), never the amounts returned by the
 ///     position manager — fee-on-transfer tokens would otherwise over-credit. Claims
 ///     decrement both. `owedTotal` belongs to exited holders: the vault must exclude it
 ///     from `sweepSurplus` (AsyncBatchVault: balance - idle - pending - claimable must
@@ -195,7 +197,8 @@ library V3Positions {
         if (supply == 0 || shares > supply) revert InvalidSlice();
         (,,,,,,, uint128 liquidity,,,,) = npm.positions(tokenId);
         // shares <= supply, so the slice never exceeds the position's liquidity.
-        uint128 part = (uint256(liquidity) * shares / supply).toUint128();
+        // mulDiv: no intermediate overflow, whatever the share supply.
+        uint128 part = Math.mulDiv(liquidity, shares, supply).toUint128();
         return _withdraw(npm, tokenId, part, 0, 0, deadline, recipient);
     }
 

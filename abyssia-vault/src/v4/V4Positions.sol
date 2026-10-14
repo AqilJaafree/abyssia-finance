@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
@@ -32,13 +33,18 @@ import {PoolKey, PoolKeyLib} from "../types/PoolKey.sol";
 /// test/v4/V4PositionsHarness.sol): a transient-bound, gas-capped `try` self-call per
 /// position that calls `withdrawSlice`, an EIP-150 gas guard, an IOU fallback to the
 /// vault (`recipient == address(this)`, amounts = the vault's principal delta returned
-/// here), and a skip when even that fails. A failed take reverts the whole
+/// here), and a skip when even that fails. Record harvested fees and IOUs INSIDE the
+/// self-call frame: balance deltas are token-reported, so an absurd one must only fail
+/// that attempt. Reject receivers that would swallow a slice (the vault itself, the
+/// PositionManager, the PoolManager, Permit2). A failed take reverts the whole
 /// `modifyLiquidities` (and the fee harvest with it, being in the same frame), so a skip
 /// leaves the position untouched.
 ///
 /// HOOKS. A hook can run code on every liquidity change and, with return-delta
 /// permissions, alter the amounts. Only registry-allowlisted hooks may be used; a hook
-/// that reverts on removal can block withdrawals and exits from its pool.
+/// that reverts on removal can block withdrawals and exits from its pool, and remove-
+/// liquidity callbacks run TWICE per slice (fee harvest + decrease), so their gas counts
+/// double against the in-kind exit's per-position gas cap.
 library V4Positions {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
@@ -184,7 +190,8 @@ library V4Positions {
         if (supply == 0 || shares > supply) revert InvalidSlice();
         uint128 liquidity = posm.getPositionLiquidity(tokenId);
         // shares <= supply, so the slice never exceeds the position's liquidity.
-        uint128 part = (uint256(liquidity) * shares / supply).toUint128();
+        // mulDiv: no intermediate overflow, whatever the share supply.
+        uint128 part = Math.mulDiv(liquidity, shares, supply).toUint128();
         return _withdraw(posm, tokenId, part, 0, 0, deadline, recipient);
     }
 

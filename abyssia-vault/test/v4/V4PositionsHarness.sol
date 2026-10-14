@@ -56,6 +56,7 @@ contract V4PositionsHarness {
     error UnboundSlice();
     error ExitInProgress();
     error InsufficientGasForSlice();
+    error InvalidReceiver();
 
     constructor(IV4PositionManager posm_, IPermit2 permit2_, IStateView stateView_) {
         posm = posm_;
@@ -98,6 +99,7 @@ contract V4PositionsHarness {
     /// position and emit SliceSkipped.
     /// @param supply total share supply BEFORE the exiting shares were burned.
     function inKindExit(uint256 shares, uint256 supply, address receiver) external {
+        _checkReceiver(receiver);
         // No nested exit (a token callback re-entering here would clobber the binding).
         if (_exitBinding() != bytes32(0)) revert ExitInProgress();
         EXIT_BINDING.asBytes32().tstore(keccak256(abi.encode(shares, supply, receiver)));
@@ -108,14 +110,13 @@ contract V4PositionsHarness {
         EXIT_BINDING.asBytes32().tstore(bytes32(0));
     }
 
+    /// @dev All bookkeeping (harvested fees, IOUs) happens INSIDE the gas-capped `sliceTo`
+    /// frame: token-reported balance deltas are untrusted, so an overflow they cause only
+    /// fails that one attempt (-> fallback / skip), never the whole exit.
     function _exitPosition(uint256 tokenId, uint256 shares, uint256 supply, address receiver) private {
-        (PoolKey memory key,) = posm.getPoolAndPositionInfo(tokenId);
         _requireSliceGas();
         uint256 gasBefore = gasleft();
-        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, receiver) returns (
-            uint256 fee0, uint256 fee1, uint256, uint256
-        ) {
-            _recordHarvest(key, fee0, fee1);
+        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, receiver) {
             return;
         } catch {}
         // Only a cheap failure earns a second attempt: a gas burner (at any call depth)
@@ -125,15 +126,20 @@ contract V4PositionsHarness {
             return;
         }
         _requireSliceGas();
-        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, address(this)) returns (
-            uint256 fee0, uint256 fee1, uint256 got0, uint256 got1
-        ) {
-            _recordHarvest(key, fee0, fee1);
-            _recordOwed(receiver, key.currency0, got0);
-            _recordOwed(receiver, key.currency1, got1);
-        } catch {
+        try this.sliceTo{gas: SLICE_GAS}(tokenId, shares, supply, receiver, address(this)) {}
+        catch {
             emit SliceSkipped(tokenId);
         }
+    }
+
+    /// @dev A slice sent to any of these would be lost or unaccounted: to the vault it
+    /// lands with no IOU, to the PositionManager anyone can SWEEP it, to the PoolManager
+    /// it is stranded, and 0..2 are rejected by the library anyway.
+    function _checkReceiver(address receiver) private view {
+        if (
+            uint160(receiver) <= 2 || receiver == address(this) || receiver == address(posm)
+                || receiver == posm.poolManager() || receiver == address(permit2)
+        ) revert InvalidReceiver();
     }
 
     /// @dev EIP-150: a CALL forwards at most 63/64 of the remaining gas, so without this
@@ -160,17 +166,26 @@ contract V4PositionsHarness {
     /// `inKindExit`, and the slice can only go to that receiver or to this contract (the
     /// IOU fallback). The library returns balance deltas measured inside this gas-capped
     /// frame, so untrusted `balanceOf` calls stay under SLICE_GAS and fee-on-transfer
-    /// tokens cannot over-credit an IOU.
+    /// tokens cannot over-credit an IOU. Harvested fees and (for the vault-recipient
+    /// fallback) the IOU are recorded here too, so a token reporting an absurd delta
+    /// can only fail this attempt.
     function sliceTo(uint256 tokenId, uint256 shares, uint256 supply, address receiver, address recipient)
         external
-        returns (uint256, uint256, uint256, uint256)
+        returns (uint256 fee0, uint256 fee1, uint256 got0, uint256 got1)
     {
         if (msg.sender != address(this)) revert OnlySelf();
         if (
             _exitBinding() != keccak256(abi.encode(shares, supply, receiver))
                 || (recipient != receiver && recipient != address(this))
         ) revert UnboundSlice();
-        return V4Positions.withdrawSlice(s, posm, tokenId, shares, supply, recipient, block.timestamp);
+        (fee0, fee1, got0, got1) =
+            V4Positions.withdrawSlice(s, posm, tokenId, shares, supply, recipient, block.timestamp);
+        (PoolKey memory key,) = posm.getPoolAndPositionInfo(tokenId);
+        _recordHarvest(key, fee0, fee1);
+        if (recipient == address(this)) {
+            _recordOwed(receiver, key.currency0, got0);
+            _recordOwed(receiver, key.currency1, got1);
+        }
     }
 
     function claimOwed(address token) external {
