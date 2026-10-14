@@ -9,7 +9,8 @@ import {V4PositionsHarness} from "../v4/V4PositionsHarness.sol";
 import {AbyssiaVault} from "../../src/AbyssiaVault.sol";
 import {VaultRegistry} from "../../src/registry/VaultRegistry.sol";
 import {VaultBook} from "../../src/libraries/VaultBook.sol";
-import {VaultOps} from "../../src/libraries/VaultOps.sol";
+import {VaultRebalance} from "../../src/libraries/VaultRebalance.sol";
+import {Shapes} from "../../src/libraries/Shapes.sol";
 import {V4Positions} from "../../src/v4/V4Positions.sol";
 import {INonfungiblePositionManager as INPM} from "../../src/interfaces/INonfungiblePositionManager.sol";
 import {IV4PositionManager} from "../../src/interfaces/IV4PositionManager.sol";
@@ -101,6 +102,7 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
         usdc.approve(address(vault), 10_000e6);
         vault.requestDeposit(10_000e6);
         vm.stopPrank();
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vault.settle(price);
@@ -109,14 +111,20 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
 
         vm.startPrank(keeper);
         uint256 got = vault.swap(poolId, true, 1_000e6, 950e6); // floor: 1:1 price minus 5%
-        uint256 id =
-            vault.openPosition(VaultOps.OpenArgs(poolId, -600, 600, 1_000e6, got, 0, 0, block.timestamp));
+        (, int24 tick,,) = IStateView(V4_STATE_VIEW).getSlot0(poolId);
+        vault.rebalance(
+            VaultRebalance.Args(
+                poolId, Shapes.Spec(Shapes.SPOT, Shapes.BOTH, 1, 1200), 1_000e6, got, tick, block.timestamp
+            )
+        );
         vm.stopPrank();
+        uint256 id = vault.positionAt(VaultBook.Protocol.V4, 0);
         assertEq(IV4PositionManager(V4_POSITION_MANAGER).ownerOf(id), address(vault));
 
         _traderSwap(address(meme), 500e6);
         _traderSwap(address(usdc), 500e6);
         uint256 idleBefore = vault.idleAssets();
+        vm.warp(block.timestamp + vault.minSettleInterval());
         price = vault.sharePrice();
         vm.prank(keeper);
         vault.settle(price);

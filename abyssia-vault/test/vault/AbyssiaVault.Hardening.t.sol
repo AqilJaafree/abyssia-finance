@@ -8,6 +8,7 @@ import {VaultRegistry} from "../../src/registry/VaultRegistry.sol";
 import {VaultBook} from "../../src/libraries/VaultBook.sol";
 import {VaultOps} from "../../src/libraries/VaultOps.sol";
 import {PoolKey} from "../../src/types/PoolKey.sol";
+import {Shapes} from "../../src/libraries/Shapes.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
@@ -31,9 +32,11 @@ contract AbyssiaVaultHardeningTest is AbyssiaVaultTestBase {
     function test_settleRevertsWhenPoolPricesAreMovedAroundIt() public {
         _keeperSwap(v3PoolId, true, 2_500e6); // MEME inventory priced via the v3 pool
         _requestDeposit(bob, 1_000e6);
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 fair = vault.sharePrice();
 
         _traderSwapV3(address(usdc), 200_000e6); // pump MEME
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 live = vault.sharePrice();
         assertGt(live, fair * 10_050 / 10_000);
 
@@ -119,8 +122,7 @@ contract AbyssiaVaultHardeningTest is AbyssiaVaultTestBase {
     // ---------------------------------------------------------------------
 
     function test_openReservesTheTokenSlot() public {
-        (int24 lo, int24 hi) = _usdcSide();
-        _open(v4PoolId, lo, hi, 100e6, 0); // USDC only: no MEME held yet
+        _rebalance(v4PoolId, _spec(Shapes.SPOT, Shapes.USDC_ONLY, 1, 600), 100e6, 0); // no MEME held yet
         assertEq(vault.tokenPool(address(meme)), v4PoolId);
         assertEq(vault.inventoryTokens().length, 1);
     }
@@ -218,13 +220,10 @@ contract AbyssiaVaultHardeningTest is AbyssiaVaultTestBase {
     /// The guardian override can't accept a wide band either.
     function test_guardianOverrideToleranceIsCapped() public {
         uint256 cap = vault.MAX_SETTLE_TOLERANCE_BPS();
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(guardian);
         vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
         vault.settleAcceptingPriceMove(price, cap + 1);
-    }
-
-    function _usdcSide() internal view returns (int24 lo, int24 hi) {
-        return address(usdc) < address(meme) ? (int24(600), int24(1200)) : (int24(-1200), int24(-600));
     }
 }

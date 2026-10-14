@@ -135,6 +135,7 @@ contract AbyssiaVaultSwapSettleTest is AbyssiaVaultTestBase {
         uint256 shares = vault.balanceOf(alice);
         vm.prank(alice);
         vault.requestRedeem(shares * 9 / 10);
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vm.expectPartialRevert(AsyncBatchVault.InsufficientIdle.selector);
@@ -154,8 +155,7 @@ contract AbyssiaVaultSwapSettleTest is AbyssiaVaultTestBase {
     function test_frozenTokenHarvestIsSkipped() public {
         MockFreezableERC20 frozen = new MockFreezableERC20("Frozen", "FRZ");
         (, bytes32 poolId) = _addV4Pool(address(frozen));
-        uint256 got = _keeperSwap(poolId, true, 500e6);
-        uint256 id = _open(poolId, -600, 600, 500e6, got);
+        uint256 id = _openInRange(poolId, 500e6);
         _traderSwapV4Key(poolId, address(frozen), 500e6); // fees in the frozen token
         frozen.freeze();
 

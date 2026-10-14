@@ -12,6 +12,8 @@ import {AbyssiaVault} from "../../src/AbyssiaVault.sol";
 import {VaultRegistry} from "../../src/registry/VaultRegistry.sol";
 import {VaultBook} from "../../src/libraries/VaultBook.sol";
 import {VaultOps} from "../../src/libraries/VaultOps.sol";
+import {VaultRebalance} from "../../src/libraries/VaultRebalance.sol";
+import {Shapes} from "../../src/libraries/Shapes.sol";
 import {V3Positions} from "../../src/v3/V3Positions.sol";
 import {V4Positions} from "../../src/v4/V4Positions.sol";
 import {INonfungiblePositionManager as INPM} from "../../src/interfaces/INonfungiblePositionManager.sol";
@@ -78,6 +80,8 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         (v3Pool, v3PoolId) = _addV3Pool(address(meme));
         (v4Key, v4PoolId) = _addV4Pool(address(meme));
         vault = new AbyssiaVault(_config());
+        // Let the v3 pools' TWAP window fill (the vault's v3 swaps and rebalances need it).
+        vm.warp(block.timestamp + vault.twapWindow());
     }
 
     /// @dev Test fixture class params (not a production setting).
@@ -90,7 +94,7 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
             minWidthTicks: 60,
             maxWidthTicks: 120_000,
             stopLossBps: 3_000,
-            rebalanceCooldown: 10 minutes,
+            rebalanceCooldown: 0, // tests rebalance a pool repeatedly; the cooldown has its own test
             minPoolLiquidity: 1e9
         });
     }
@@ -125,12 +129,15 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         (address t0, address t1) = _sorted(token);
         pool = IV3FactoryInit(v3.factory).createPool(t0, t1, FEE);
         IV3PoolInit(pool).initialize(TickMath.getSqrtPriceAtTick(0));
+        IUniswapV3Pool(pool).increaseObservationCardinalityNext(64); // room for a TWAP
         V3PositionsHarness lp = new V3PositionsHarness(INPM(v3.positionManager));
         _mint(t0, address(lp), 1e12);
         _mint(t1, address(lp), 1e12);
         lp.open(V3Positions.OpenParams(t0, t1, FEE, -FULL, FULL, 1e12, 1e12, 0, 0, block.timestamp));
         vm.prank(admin);
         poolId = registry.addV3Pool(token, FEE, MEMECOIN);
+        // A pool added after setUp needs its own TWAP window to fill.
+        if (address(vault) != address(0)) vm.warp(block.timestamp + vault.twapWindow());
     }
 
     /// @dev Same for a hookless v4 pool.
@@ -174,6 +181,7 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
 
     /// @dev Settles at the live price (in tests the pool prices are the fair prices).
     function _settle() internal {
+        vm.warp(block.timestamp + vault.minSettleInterval());
         uint256 price = vault.sharePrice();
         vm.prank(keeper);
         vault.settle(price);
@@ -188,27 +196,44 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
         shares = vault.claimDeposit(id, user);
     }
 
-    function _openArgs(bytes32 poolId, int24 lower, int24 upper, uint256 usdcAmt, uint256 tokenAmt)
+    function _spec(uint8 shape, uint8 side, uint8 ranges, int24 width)
+        internal
+        pure
+        returns (Shapes.Spec memory)
+    {
+        return Shapes.Spec(shape, side, ranges, width);
+    }
+
+    function _tick(bytes32 poolId) internal view returns (int24 tick) {
+        VaultRegistry.PoolInfo memory info = registry.getPool(poolId);
+        if (info.protocol == VaultRegistry.Protocol.V3) (, tick,,,,,) = IUniswapV3Pool(info.v3Pool).slot0();
+        else (, tick,,) = IStateView(v4.stateView).getSlot0(poolId);
+    }
+
+    function _rebalanceArgs(bytes32 poolId, Shapes.Spec memory spec, uint256 usdcAmt, uint256 tokenAmt)
         internal
         view
-        returns (VaultOps.OpenArgs memory)
+        returns (VaultRebalance.Args memory)
     {
-        return VaultOps.OpenArgs(poolId, lower, upper, usdcAmt, tokenAmt, 0, 0, block.timestamp);
+        return VaultRebalance.Args(poolId, spec, usdcAmt, tokenAmt, _tick(poolId), block.timestamp);
     }
 
-    function _open(bytes32 poolId, int24 lower, int24 upper, uint256 usdcAmt, uint256 tokenAmt)
-        internal
-        returns (uint256 tokenId)
-    {
+    /// @dev Keeper rebalance of `poolId` into `spec` at the pool's current tick.
+    function _rebalance(bytes32 poolId, Shapes.Spec memory spec, uint256 usdcAmt, uint256 tokenAmt) internal {
+        VaultRebalance.Args memory a = _rebalanceArgs(poolId, spec, usdcAmt, tokenAmt);
         vm.prank(keeper);
-        tokenId = vault.openPosition(_openArgs(poolId, lower, upper, usdcAmt, tokenAmt));
+        vault.rebalance(a);
     }
 
-    /// @dev Buy MEME-side tokens with `amount` USDC through the pool, then open an in-range
-    /// position (-600..600) with `amount` USDC plus everything bought.
+    /// @dev Buy the pool's token with `amount` USDC, then rebalance the pool into one Spot
+    /// range of 1,200 ticks around the price holding `amount` USDC plus everything bought.
+    /// Returns the new position's id (the newest in its protocol's list).
     function _openInRange(bytes32 poolId, uint256 amount) internal returns (uint256) {
         uint256 got = _keeperSwap(poolId, true, amount);
-        return _open(poolId, -600, 600, amount, got);
+        _rebalance(poolId, _spec(Shapes.SPOT, Shapes.BOTH, 1, 1200), amount, got);
+        VaultBook.Protocol p = registry.getPool(poolId).protocol == VaultRegistry.Protocol.V3 ? P3 : P4;
+        (uint256 n3, uint256 n4) = vault.positionCount();
+        return vault.positionAt(p, (p == P3 ? n3 : n4) - 1);
     }
 
     /// @dev Keeper swap of `amountIn` with the loosest minOut the vault accepts.
