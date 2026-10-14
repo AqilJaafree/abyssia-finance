@@ -38,7 +38,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// yearly management fee.
     uint256 public constant MAX_PERFORMANCE_FEE_BPS = 3_000; // 30%
     uint256 public constant MAX_MANAGEMENT_FEE_BPS = 200; // 2% / year
-    /// @dev Bounds of the performance-fee period.
+    /// @dev Bounds of the performance-fee period. A period must also be at least
+    /// MIN_FEE_PERIOD old before a gain is charged early (see _accrueFees).
     uint256 public constant MIN_FEE_PERIOD = 1 days;
     uint256 public constant MAX_FEE_PERIOD = 90 days;
     /// @dev How long a batch lock lasts at most, and how long a batch must have been open
@@ -659,7 +660,11 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
     function _setFees(uint256 performanceBps, uint256 managementBps) private {
         _accrueManagementFee();
-        if (totalSupply() != 0 && highWaterMark != 0) _chargePerformance(feePeriodLow);
+        if (totalSupply() != 0 && highWaterMark != 0 && _canChargeEarly()) {
+            // Never above the current price: a gain lost since the last settlement is not charged.
+            uint256 price = _sharePrice();
+            _chargePerformance(price < feePeriodLow ? price : feePeriodLow);
+        }
         (performanceFeeBps, managementFeeBps) = (performanceBps, managementBps);
         emit FeesSet(performanceBps, managementBps);
     }
@@ -683,8 +688,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @dev Mint fee shares to the treasury and return the post-fee share price. The
     /// management fee accrues every settlement. The performance fee (see `feePeriod`) is
     /// charged when the period ends, and early, up to the low so far, at a settlement whose
-    /// batch has deposits or redemptions, so those holders enter after, and leave having
-    /// paid, the fee on every gain that has held. Gains since the period opened wait for it to
+    /// batch has deposits or redemptions once the period is MIN_FEE_PERIOD old (so its
+    /// opening price has held at least that long), so those holders enter after, and leave
+    /// having paid, the fee on every gain that has held. Gains since the period opened wait for it to
     /// end (and are shared by holders entering meanwhile, or skipped by in-kind exits). The
     /// first settlement, and the first after the vault empties, only set the mark.
     function _accrueFees(bool flows) private returns (uint256 price) {
@@ -698,7 +704,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         }
         if (price < feePeriodLow) feePeriodLow = price;
         bool over = _feePeriodOver();
-        if (over || flows) {
+        if (over || (flows && _canChargeEarly())) {
             _chargePerformance(feePeriodLow);
             price = _sharePrice();
         }
@@ -761,6 +767,10 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         return block.timestamp >= feePeriodStart + feePeriod;
     }
 
+    function _canChargeEarly() private view returns (bool) {
+        return block.timestamp >= feePeriodStart + MIN_FEE_PERIOD;
+    }
+
     /// @notice For the keeper: the share price `settle` checks its expected price against
     /// (pre-fee) and the one the batch converts at (post-fee), from NAV as it stands now.
     /// Settlement harvests LP fees first, so both read higher at settlement by those fees.
@@ -772,7 +782,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         supply += _managementFeeShares(supply);
         postFee = _priceAt(assets, supply);
         Batch storage b = batches[currentBatchId];
-        if (_feePeriodOver() || b.depositAssets != 0 || b.redeemShares != 0) {
+        if (_feePeriodOver() || ((b.depositAssets != 0 || b.redeemShares != 0) && _canChargeEarly())) {
             uint256 low = feePeriodLow < postFee ? feePeriodLow : postFee;
             supply += _performanceFeeShares(low, assets, supply);
             postFee = _priceAt(assets, supply);
