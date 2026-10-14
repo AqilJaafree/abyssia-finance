@@ -30,7 +30,15 @@ External library (delegatecalled, so the vault owns every position NFT) that wor
 - `open`, `withdraw` (principal only), `collectFees`, `close`, `positionAmounts` (valuation at the current pool price), capped at `MAX_POSITIONS`.
 - `withdrawSlice` for in-kind exits: each position is handled separately and gas-capped, so one frozen, blacklisting or gas-wasting token cannot block a holder's exit; tokens that can't be delivered are held as claimable IOUs.
 
-Not yet wired into a concrete vault: that comes with the shapes/rebalance work, along with the v4 adapter, fees, the factory and deployment.
+### `src/v4/V4Positions.sol` — Uniswap v4 adapter
+
+External library, same model as the v3 adapter, working through Uniswap's v4 `PositionManager` (`modifyLiquidities`), paying through Permit2:
+
+- `open` (liquidity computed from the desired amounts at the current price; Permit2 allowances are exact, expire the same block and are reset), `withdraw`, `collectFees`, `close`, `positionAmounts`, capped at `MAX_POSITIONS`. ERC-20 pools only; native currency is rejected.
+- v4 pays out all accrued fees on any liquidity change, so every withdrawal first harvests fees to the vault, then sends only principal to the recipient. Returned amounts are balance deltas (fee-on-transfer safe).
+- `withdrawSlice` for in-kind exits, with the same per-position isolation, gas cap and IOU fallback as v3.
+
+Neither adapter is wired into a concrete vault yet: that comes with the shapes/rebalance work, along with fees, the factory and deployment.
 
 ### `script/DeployUniswapV3.s.sol` — testnet only
 
@@ -59,6 +67,7 @@ Run a subset:
 forge test --match-path "test/AsyncBatchVault.*"   # vault core
 forge test --match-path "test/registry/*"          # registry
 forge test --match-path "test/v3/*"                # v3 adapter
+forge test --match-path "test/v4/*"                # v4 adapter
 forge test --match-test testFuzz -vv               # fuzz tests only (1000 runs each)
 forge test --gas-report                            # gas usage per function
 ```
@@ -70,6 +79,7 @@ forge test --gas-report                            # gas usage per function
 | `test/AsyncBatchVault.*.t.sol` | Deposits, redemptions, settlement and the price guard, in-kind exits, parameters, events, edge cases, hardening, fuzzing |
 | `test/registry/` | Class parameters, pool allowlist, hardening, timelocked admin vs instant guardian |
 | `test/v3/` | v3 adapter against a real local Uniswap v3 deployment, in-kind exits with frozen and gas-burning tokens, fuzzing |
+| `test/v4/` | v4 adapter against Uniswap's official v4 bytecode deployed locally (PoolManager, PositionManager, StateView, Permit2), fee harvesting, in-kind exits with hostile tokens, fuzzing |
 | `test/script/` | Pins the vendored SwapRouter02 bytecode hash |
 | `test/fork/` | Fork tests against Arc testnet and mainnet |
 | `test/mocks/`, `test/harness/` | Mock tokens/pools and test harnesses |
@@ -83,7 +93,7 @@ cp .env.example .env       # forge auto-loads .env
 forge test --match-path "test/fork/*" -vv
 ```
 
-- `ARC_TESTNET_RPC_URL`: registry against the real Uniswap v4 deployment, and a rehearsal of the v3 deploy script.
+- `ARC_TESTNET_RPC_URL`: registry and the v4 adapter against the real Uniswap v4 deployment, and a rehearsal of the v3 deploy script.
 - `ARC_MAINNET_RPC_URL`: the v3 adapter against Uniswap's real v3 position manager and router.
 
 Notes:
