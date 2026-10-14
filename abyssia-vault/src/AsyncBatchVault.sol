@@ -57,6 +57,9 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public maxCycleMoveBps;
     /// @notice Share price (assets per 10**decimals() shares) at the last settlement; 0 before the first.
     uint256 public lastSharePrice;
+    /// @notice ERC-7540 operators: `operator` may cancel and claim on behalf of `controller`
+    /// (and choose the receiver), so approving one is full trust over those requests.
+    mapping(address controller => mapping(address operator => bool)) public isOperator;
 
     event DepositRequested(address indexed user, uint256 indexed batchId, uint256 assets);
     event DepositRequestCancelled(address indexed user, uint256 indexed batchId, uint256 assets);
@@ -77,6 +80,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     event MaxTotalAssetsSet(uint256 value);
     event MaxCycleMoveBpsSet(uint256 value);
     event SurplusSwept(address indexed to, uint256 surplus);
+    event OperatorSet(address indexed controller, address indexed operator, bool approved);
 
     error AsyncOnly();
     error AssetNotSixDecimals();
@@ -93,6 +97,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     error NotLower();
     error PriceNotAsExpected(uint256 expectedPrice, uint256 livePrice);
     error SharesToVaultNotAllowed();
+    error NotOperator(address controller, address caller);
+    error InvalidOperator();
 
     constructor(
         IERC20 asset_,
@@ -205,14 +211,24 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @notice Withdraw your whole deposit request from the open (unsettled) batch.
     /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
     function cancelDepositRequest() external nonReentrant {
+        _cancelDeposit(msg.sender, msg.sender);
+    }
+
+    /// @notice Operator version: cancel `controller`'s open deposit request, refunding to `receiver`.
+    function cancelDepositRequestFor(address controller, address receiver) external nonReentrant {
+        _requireOperator(controller);
+        _cancelDeposit(controller, receiver);
+    }
+
+    function _cancelDeposit(address controller, address receiver) private {
         uint256 id = currentBatchId;
-        uint256 assets = depositRequestOf[id][msg.sender];
+        uint256 assets = depositRequestOf[id][controller];
         if (assets == 0) revert NothingToCancel();
-        depositRequestOf[id][msg.sender] = 0;
+        depositRequestOf[id][controller] = 0;
         batches[id].depositAssets -= assets.toUint128();
         pendingDepositAssets -= assets;
-        IERC20(asset()).safeTransfer(msg.sender, assets);
-        emit DepositRequestCancelled(msg.sender, id, assets);
+        IERC20(asset()).safeTransfer(receiver, assets);
+        emit DepositRequestCancelled(controller, id, assets);
     }
 
     function requestRedeem(uint256 shares) external nonReentrant whenNotPaused {
@@ -229,13 +245,24 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     /// @notice Take back your whole redeem request from the open (unsettled) batch.
     /// @dev Allowed right up until settlement (a later plan may add a pre-settlement cancel cutoff).
     function cancelRedeemRequest() external nonReentrant {
+        _cancelRedeem(msg.sender, msg.sender);
+    }
+
+    /// @notice Operator version: cancel `controller`'s open redeem request, returning the
+    /// escrowed shares to `receiver`.
+    function cancelRedeemRequestFor(address controller, address receiver) external nonReentrant {
+        _requireOperator(controller);
+        _cancelRedeem(controller, receiver);
+    }
+
+    function _cancelRedeem(address controller, address receiver) private {
         uint256 id = currentBatchId;
-        uint256 shares = redeemRequestOf[id][msg.sender];
+        uint256 shares = redeemRequestOf[id][controller];
         if (shares == 0) revert NothingToCancel();
-        redeemRequestOf[id][msg.sender] = 0;
+        redeemRequestOf[id][controller] = 0;
         batches[id].redeemShares -= shares.toUint128();
-        _transfer(address(this), msg.sender, shares);
-        emit RedeemRequestCancelled(msg.sender, id, shares);
+        _transfer(address(this), receiver, shares);
+        emit RedeemRequestCancelled(controller, id, shares);
     }
 
     // ---------------------------------------------------------------------
@@ -319,27 +346,79 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     // Claims (always available, even when paused)
     // ---------------------------------------------------------------------
 
-    function claimDeposit(uint256 batchId, address receiver) external nonReentrant returns (uint256 shares) {
-        Batch storage b = batches[batchId];
-        if (!b.settled) revert BatchNotSettled(batchId);
-        uint256 assets = depositRequestOf[batchId][msg.sender];
-        if (assets == 0) revert NothingToClaim();
-        depositRequestOf[batchId][msg.sender] = 0;
-        shares = assets.mulDiv(b.depositShares, b.depositAssets, Math.Rounding.Floor);
-        _transfer(address(this), receiver, shares);
-        emit DepositClaimed(msg.sender, batchId, receiver, shares);
+    function claimDeposit(uint256 batchId, address receiver) external nonReentrant returns (uint256) {
+        return _claimDeposit(batchId, msg.sender, receiver);
     }
 
-    function claimRedeem(uint256 batchId, address receiver) external nonReentrant returns (uint256 assets) {
+    /// @notice Operator version: claim `controller`'s deposit shares to `receiver`.
+    function claimDepositFor(uint256 batchId, address controller, address receiver)
+        external
+        nonReentrant
+        returns (uint256)
+    {
+        _requireOperator(controller);
+        return _claimDeposit(batchId, controller, receiver);
+    }
+
+    function claimRedeem(uint256 batchId, address receiver) external nonReentrant returns (uint256) {
+        return _claimRedeem(batchId, msg.sender, receiver);
+    }
+
+    /// @notice Operator version: claim `controller`'s redemption USDC to `receiver`.
+    function claimRedeemFor(uint256 batchId, address controller, address receiver)
+        external
+        nonReentrant
+        returns (uint256)
+    {
+        _requireOperator(controller);
+        return _claimRedeem(batchId, controller, receiver);
+    }
+
+    function _claimDeposit(uint256 batchId, address controller, address receiver)
+        private
+        returns (uint256 shares)
+    {
         Batch storage b = batches[batchId];
         if (!b.settled) revert BatchNotSettled(batchId);
-        uint256 shares = redeemRequestOf[batchId][msg.sender];
+        uint256 assets = depositRequestOf[batchId][controller];
+        if (assets == 0) revert NothingToClaim();
+        depositRequestOf[batchId][controller] = 0;
+        shares = assets.mulDiv(b.depositShares, b.depositAssets, Math.Rounding.Floor);
+        _transfer(address(this), receiver, shares);
+        emit DepositClaimed(controller, batchId, receiver, shares);
+    }
+
+    function _claimRedeem(uint256 batchId, address controller, address receiver)
+        private
+        returns (uint256 assets)
+    {
+        Batch storage b = batches[batchId];
+        if (!b.settled) revert BatchNotSettled(batchId);
+        uint256 shares = redeemRequestOf[batchId][controller];
         if (shares == 0) revert NothingToClaim();
-        redeemRequestOf[batchId][msg.sender] = 0;
+        redeemRequestOf[batchId][controller] = 0;
         assets = shares.mulDiv(b.redeemAssets, b.redeemShares, Math.Rounding.Floor);
         claimableAssets -= assets;
         IERC20(asset()).safeTransfer(receiver, assets);
-        emit RedeemClaimed(msg.sender, batchId, receiver, assets);
+        emit RedeemClaimed(controller, batchId, receiver, assets);
+    }
+
+    // ---------------------------------------------------------------------
+    // Operators (ERC-7540)
+    // ---------------------------------------------------------------------
+
+    /// @notice Approve or revoke `operator` to cancel and claim your requests, to any receiver.
+    function setOperator(address operator, bool approved) external returns (bool) {
+        if (operator == msg.sender || operator == address(0)) revert InvalidOperator();
+        isOperator[msg.sender][operator] = approved;
+        emit OperatorSet(msg.sender, operator, approved);
+        return true;
+    }
+
+    function _requireOperator(address controller) private view {
+        if (msg.sender != controller && !isOperator[controller][msg.sender]) {
+            revert NotOperator(controller, msg.sender);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -400,7 +479,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     }
 
     /// @notice Send out USDC the vault holds beyond its accounting (donations, stray
-    /// transfers): balance − idleAssets − pendingDepositAssets − claimableAssets.
+    /// transfers): balance − idleAssets − pendingDepositAssets − claimableAssets − USDC the
+    /// subclass holds for others (`_reservedAssets`, e.g. in-kind exit IOUs).
     function sweepSurplus(address to)
         external
         nonReentrant
@@ -408,8 +488,8 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
         returns (uint256 surplus)
     {
         if (to == address(0)) revert ZeroAddress();
-        surplus =
-            IERC20(asset()).balanceOf(address(this)) - idleAssets - pendingDepositAssets - claimableAssets;
+        surplus = IERC20(asset()).balanceOf(address(this)) - idleAssets - pendingDepositAssets
+            - claimableAssets - _reservedAssets();
         IERC20(asset()).safeTransfer(to, surplus);
         emit SurplusSwept(to, surplus);
     }
@@ -479,4 +559,10 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
 
     /// @dev Runs at the start of every settlement (fee accrual goes here).
     function _beforeSettle() internal virtual;
+
+    /// @dev USDC held by the vault that belongs to neither NAV nor the request queues
+    /// (e.g. in-kind exit IOUs). Excluded from `sweepSurplus`.
+    function _reservedAssets() internal view virtual returns (uint256) {
+        return 0;
+    }
 }
