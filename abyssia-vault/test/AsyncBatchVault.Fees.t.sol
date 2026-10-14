@@ -236,7 +236,7 @@ contract AsyncBatchVaultFeesTest is VaultTestBase {
         _settle();
         _settleAfterPeriod();
         _gain(bound(g2, 0, 15 * USDC));
-        vm.warp(block.timestamp + bound(dt, 60, 2 * PERIOD));
+        vm.warp(block.timestamp + bound(dt, vault.minSettleInterval(), 2 * PERIOD));
         if (flows) _requestDeposit(bob, 10 * USDC);
         if (redeem) {
             vm.prank(alice);

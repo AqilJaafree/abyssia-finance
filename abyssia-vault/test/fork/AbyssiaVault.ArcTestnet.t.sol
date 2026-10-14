@@ -85,7 +85,8 @@ contract AbyssiaVaultArcTestnetTest is ArcTestnetFork {
                 npm: INPM(v3.positionManager),
                 swapRouter02: ISwapRouter02(v3.swapRouter02),
                 posm: IV4PositionManager(V4_POSITION_MANAGER),
-                stateView: IStateView(V4_STATE_VIEW)
+                stateView: IStateView(V4_STATE_VIEW),
+                blockTimeMs: 500
             })
         );
     }

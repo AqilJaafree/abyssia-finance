@@ -93,7 +93,7 @@ contract AsyncBatchVaultSettleTest is VaultTestBase {
     }
 
     function test_minSettleIntervalAdminCapped() public {
-        assertEq(vault.minSettleInterval(), 60);
+        assertEq(vault.minSettleInterval(), 10 minutes);
         vm.startPrank(admin);
         vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
         vault.setMinSettleInterval(1 hours + 1);

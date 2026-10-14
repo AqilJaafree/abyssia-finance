@@ -40,6 +40,7 @@ contract DeployAbyssia is Script {
         address swapRouter02;
         address posm;
         address stateView;
+        uint256 blockTimeMs;
     }
 
     struct Settings {
@@ -100,7 +101,8 @@ contract DeployAbyssia is Script {
                 npm: 0x1238536071E1c677A632429e3655c799b22cDA52,
                 swapRouter02: 0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E,
                 posm: 0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4,
-                stateView: 0xE1Dd9c3fA50EDB962E442f60DfBc432e24537E4C
+                stateView: 0xE1Dd9c3fA50EDB962E442f60DfBc432e24537E4C,
+                blockTimeMs: 12_000
             });
         }
         if (chainId == ARC_MAINNET) {
@@ -110,7 +112,8 @@ contract DeployAbyssia is Script {
                 npm: 0x39654A85A4C05127f5Fd6ED22CAeC077A0fB1377,
                 swapRouter02: 0x53BF6B0684Ec7eF91e1387Da3D1a1769bC5A6F77,
                 posm: 0x6049c9a0e26405C0985f9E3685C87d0aE917f82B,
-                stateView: 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b
+                stateView: 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b,
+                blockTimeMs: 500 // measured: 10,000 blocks in ~5,070 s
             });
         }
         revert UnsupportedChain(chainId);
@@ -226,7 +229,8 @@ contract DeployAbyssia is Script {
             npm: INPM(n.npm),
             swapRouter02: ISwapRouter02(n.swapRouter02),
             posm: IV4PositionManager(n.posm),
-            stateView: IStateView(n.stateView)
+            stateView: IStateView(n.stateView),
+            blockTimeMs: n.blockTimeMs
         });
     }
 }

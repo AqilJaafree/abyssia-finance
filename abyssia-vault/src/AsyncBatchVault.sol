@@ -78,7 +78,7 @@ abstract contract AsyncBatchVault is ERC4626, AccessControl, Pausable, Reentranc
     uint256 public settleToleranceBps = 50;
     /// @notice Minimum seconds between two keeper settlements, so a compromised keeper can't
     /// walk `lastSharePrice` by maxCycleMoveBps many times in quick succession.
-    uint256 public minSettleInterval = 60;
+    uint256 public minSettleInterval = 10 minutes;
     /// @notice Timestamp of the last settlement (0 before the first).
     uint256 public lastSettleTime;
     /// @notice Receives fees, as newly minted shares, at each settlement.

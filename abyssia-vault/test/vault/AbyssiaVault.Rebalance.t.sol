@@ -58,6 +58,10 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         vault.setPriceGuards(100, 59, 500);
         vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
         vault.setPriceGuards(100, 600, 2_001);
+        // A 1,800 s window needs 180 observations at the fixture's 10 s blocks.
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setPriceGuards(200, 1_800, 1_000);
+        vault.setMinObservations(180);
         vault.setPriceGuards(200, 1_800, 1_000);
         vm.stopPrank();
         vm.startPrank(guardian);
@@ -294,6 +298,23 @@ contract AbyssiaVaultRebalanceTest is AbyssiaVaultTestBase {
         vm.prank(admin);
         vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
         vault.setMinObservations(0);
+    }
+
+    /// The observation floor must cover the TWAP window at the chain's block time (here 10 s
+    /// blocks: 60 observations per 600 s), so a long window can't rest on a short ring.
+    function test_observationFloorCoversTheWindow() public {
+        assertEq(vault.blockTimeMs(), 10_000);
+        vm.startPrank(admin);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setMinObservations(59);
+        vault.setMinObservations(60);
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        vault.setPriceGuards(100, 601, 500);
+        vm.stopPrank();
+        AbyssiaVault.Config memory c = _config();
+        c.blockTimeMs = 499; // the default 1,200 observations would not cover 600 s
+        vm.expectRevert(AsyncBatchVault.ParamOutOfBounds.selector);
+        new AbyssiaVault(c);
     }
 
     /// A BOTH layout from USDC only skips the range containing the price (it would take zero

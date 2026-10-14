@@ -90,6 +90,7 @@ contract AbyssiaVault is AsyncBatchVault {
         ISwapRouter02 swapRouter02;
         IV4PositionManager posm;
         IStateView stateView;
+        uint256 blockTimeMs; // the chain's (shortest) block time, for the observation floor
     }
 
     VaultRegistry public immutable registry;
@@ -100,6 +101,9 @@ contract AbyssiaVault is AsyncBatchVault {
     IStateView public immutable stateView;
     IV4PoolManager public immutable poolManager;
     address internal immutable usdcToken;
+    /// @notice The chain's block time in milliseconds: one observation per block at most, so
+    /// a v3 pool's ring spans minObservations * blockTimeMs.
+    uint256 public immutable blockTimeMs;
 
     VaultBook.Book internal _book;
     uint256 public maxSwapSlippageBps;
@@ -216,7 +220,9 @@ contract AbyssiaVault is AsyncBatchVault {
         poolManager = IV4PoolManager(c.posm.poolManager());
         stateView = c.stateView;
         usdcToken = address(c.usdc);
+        blockTimeMs = c.blockTimeMs;
         _setMaxSwapSlippageBps(c.maxSwapSlippageBps);
+        _checkObservationFloor(twapWindow, minObservations);
     }
 
     // ---------------------------------------------------------------------
@@ -381,7 +387,9 @@ contract AbyssiaVault is AsyncBatchVault {
         _setMaxSwapSlippageBps(value);
     }
 
-    /// @notice Admin: the rebalance tick band and the v3 TWAP guard (window and deviation).
+    /// @notice Admin: the rebalance tick band and the reference guard (v3 TWAP window, and
+    /// the deviation allowed from the reference). The observation floor must cover the
+    /// window: to lengthen it, raise minObservations first.
     function setPriceGuards(int24 tickDeviation, uint32 window, int24 twapDeviation)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -390,13 +398,15 @@ contract AbyssiaVault is AsyncBatchVault {
             tickDeviation <= 0 || tickDeviation > MAX_REBALANCE_TICK_DEVIATION_CAP || window < MIN_TWAP_WINDOW
                 || window > MAX_TWAP_WINDOW || twapDeviation <= 0 || twapDeviation > MAX_TWAP_DEVIATION_CAP
         ) revert ParamOutOfBounds();
+        _checkObservationFloor(window, minObservations);
         (maxRebalanceTickDeviation, twapWindow, maxTwapDeviation) = (tickDeviation, window, twapDeviation);
         emit PriceGuardsSet(tickDeviation, window, twapDeviation);
     }
 
-    /// @notice Admin: the v3 observation capacity floor.
+    /// @notice Admin: the v3 observation capacity floor. It must cover twapWindow at the
+    /// chain's block time.
     function setMinObservations(uint16 value) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (value == 0) revert ParamOutOfBounds();
+        _checkObservationFloor(twapWindow, value);
         minObservations = value;
         emit MinObservationsSet(value);
     }
@@ -409,6 +419,12 @@ contract AbyssiaVault is AsyncBatchVault {
         ) revert NotLower();
         (maxRebalanceTickDeviation, maxTwapDeviation) = (tickDeviation, twapDeviation);
         emit PriceGuardsSet(tickDeviation, twapWindow, twapDeviation);
+    }
+
+    /// @dev A v3 pool's ring of `observations` must span `window` even if every block
+    /// writes one; otherwise a swap every block could wipe the TWAP's history.
+    function _checkObservationFloor(uint32 window, uint16 observations) private view {
+        if (uint256(observations) * blockTimeMs < uint256(window) * 1000) revert ParamOutOfBounds();
     }
 
     function _setMaxSwapSlippageBps(uint256 value) private {

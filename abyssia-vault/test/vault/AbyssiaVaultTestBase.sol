@@ -119,7 +119,8 @@ abstract contract AbyssiaVaultTestBase is V4Deployer {
             npm: INPM(v3.positionManager),
             swapRouter02: ISwapRouter02(v3.swapRouter02),
             posm: IV4PositionManager(v4.positionManager),
-            stateView: IStateView(v4.stateView)
+            stateView: IStateView(v4.stateView),
+            blockTimeMs: 10_000 // the fixture's 64-observation floor covers a 600 s window at 10 s blocks
         });
     }
 
