@@ -22,7 +22,7 @@ pnpm lint      # lints every package
 
 ## abyssia-vault
 
-- `src/AbyssiaVault.sol`: the deployable vault. Keeper-run Uniswap v3/v4 positions (hookless v4 pools only) and oracle-bounded swaps within the registry's class limits, fee harvesting before each settlement, an in-kind exit that survives hostile tokens (IOUs), and ERC-7540 operators. Most logic lives in `src/libraries/`.
+- `src/AbyssiaVault.sol`: the deployable vault. The keeper rebalances pools into liquidity shapes (Spot / Curve / Bid-Ask; hookless v4 pools only) and swaps within the registry's class limits, behind a tick band and v3 TWAP guards; a verified stop-loss, fee harvesting before each settlement, an in-kind exit that survives hostile tokens (IOUs), and ERC-7540 operators. Most logic lives in `src/libraries/`.
 - `src/AsyncBatchVault.sol`: ERC-4626 USDC vault with batched async deposits/redemptions and an instant in-kind exit.
 - `src/registry/VaultRegistry.sol`: per-asset-class risk limits and the allowlist of Uniswap v3/v4 USDC pools, administered through a timelock with an instant-tightening guardian role.
 - `src/v3/V3Positions.sol`: Uniswap v3 position management through the NonfungiblePositionManager.
