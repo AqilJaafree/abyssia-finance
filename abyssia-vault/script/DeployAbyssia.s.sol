@@ -30,6 +30,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 contract DeployAbyssia is Script {
     uint256 internal constant SEPOLIA = 11_155_111;
     uint256 internal constant ARC_MAINNET = 5042;
+    uint256 internal constant ARC_TESTNET = 5_042_002;
     uint24 internal constant POOL_FEE = 3000;
     int24 internal constant POOL_SPACING = 60;
 
@@ -114,6 +115,19 @@ contract DeployAbyssia is Script {
                 posm: 0x6049c9a0e26405C0985f9E3685C87d0aE917f82B,
                 stateView: 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b,
                 blockTimeMs: 400 // measured ~507 ms (10,000 blocks in ~5,070 s); rounded down for margin
+            });
+        }
+        if (chainId == ARC_TESTNET) {
+            // Uniswap v3 is not deployed on Arc testnet: Abyssia's own copy of the official
+            // build (script/DeployUniswapV3.s.sol, deployed 2026-10-15). v4 and USDC are Arc's.
+            return Network({
+                usdc: 0x3600000000000000000000000000000000000000,
+                v3Factory: 0x6a87032589b837935b1A393Dc905c84E908c6974,
+                npm: 0x9c58491817B883840737aF8E49C92eDcFF4bFf40,
+                swapRouter02: 0x13E4F948A7BF143482c2297B5Be1bc1Bc81EA8A6,
+                posm: 0x6049c9a0e26405C0985f9E3685C87d0aE917f82B,
+                stateView: 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b,
+                blockTimeMs: 400 // measured ~507 ms, as on mainnet; rounded down for margin
             });
         }
         revert UnsupportedChain(chainId);

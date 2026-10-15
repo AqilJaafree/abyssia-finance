@@ -24,7 +24,7 @@ pnpm lint      # lints every package
 
 - `src/AbyssiaVault.sol`: the deployable vault. The keeper rebalances pools into liquidity shapes (Spot / Curve / Bid-Ask; hookless v4 pools only) and swaps within the registry's class limits, behind a tick band and v3 TWAP guards; a verified stop-loss, fee harvesting before each settlement, an in-kind exit that survives hostile tokens (IOUs), and ERC-7540 operators. Most logic lives in `src/libraries/`.
 - `src/AbyssiaVaultFactory.sol`: deploys each vault from a timelock-approved hash of its code and constructor arguments, and lists them. Fees (15% performance on gains that hold through a 7-day period, optional management fee) are minted to the treasury.
-- `script/DeployAbyssia.s.sol` / `script/SepoliaTestPools.s.sol`: timelocked deployment (Ethereum Sepolia and Arc mainnet) and Sepolia test pools.
+- `script/DeployAbyssia.s.sol` / `script/TestPools.s.sol`: timelocked deployment (Ethereum Sepolia, Arc testnet and Arc mainnet) and testnet pools (`script/arc-testnet-pools.sh` on Arc testnet).
 - `src/AsyncBatchVault.sol`: ERC-4626 USDC vault with batched async deposits/redemptions and an instant in-kind exit.
 - `src/registry/VaultRegistry.sol`: per-asset-class risk limits and the allowlist of Uniswap v3/v4 USDC pools, administered through a timelock with an instant-tightening guardian role.
 - `src/v3/V3Positions.sol`: Uniswap v3 position management through the NonfungiblePositionManager.

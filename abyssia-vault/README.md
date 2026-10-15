@@ -138,7 +138,7 @@ Uniswap v3 and v4 and Circle's USDC are deployed on Sepolia, so the vault runs a
 ```sh
 # 1. Test memecoin (TMEME) with USDC pools on v3 and v4, seeded with SEED_USDC each,
 #    and the v3 pool's observation capacity raised for the vault's TWAP floor.
-forge script script/SepoliaTestPools.s.sol --tc SepoliaTestPools \
+forge script script/TestPools.s.sol --tc TestPools \
   --rpc-url $SEPOLIA_RPC_URL --broadcast --slow --skip-simulation
 # 2. Wait ~10 minutes for the v3 TWAP window to fill, set ALLOW_TOKEN to the TMEME address,
 #    then deploy the timelock, registry, factory and vault (admin handed to the timelock).
@@ -148,7 +148,7 @@ forge script script/DeployAbyssia.s.sol --tc DeployAbyssia \
 
 `--skip-simulation` makes forge take each gas limit from the node. Sepolia runs Glamsterdam, which prices new storage (~111k gas a slot) and code deposit (~1,540 gas a byte) well above forge's local EVM, so locally simulated gas limits run out on-chain. The vault's deployment needs ~37M gas; Sepolia accepts it.
 
-`DeployAbyssia` also supports Arc mainnet (addresses pinned per chain), where it requires a timelock delay of at least 48 hours and a proposer other than the deployer; it reverts on any other chain. It checks every setting's range, and fails the whole deployment unless the deployer ends up with no role anywhere. After it, the guardian posts each allowlisted v4 pool's first reference tick (`postReferenceTick(poolId, fairTick)`, from off-chain prices). Arc v3 pools need `increaseObservationCardinalityNext(1500)` before use. Circle's Sepolia USDC faucet: https://faucet.circle.com.
+`DeployAbyssia` also supports Arc testnet (below) and Arc mainnet (addresses pinned per chain); on Arc mainnet it requires a timelock delay of at least 48 hours and a proposer other than the deployer; it reverts on any other chain. It checks every setting's range, and fails the whole deployment unless the deployer ends up with no role anywhere. After it, the guardian posts each allowlisted v4 pool's first reference tick (`postReferenceTick(poolId, fairTick)`, from off-chain prices). Arc v3 pools need `increaseObservationCardinalityNext(1500)` before use. Circle's Sepolia USDC faucet: https://faucet.circle.com.
 
 ### Live on Sepolia (2026-10-14, test settings)
 
@@ -161,11 +161,34 @@ forge script script/DeployAbyssia.s.sol --tc DeployAbyssia \
 | TMEME test token | `0xae3356967807B0ff56E612020695e2B054582c99` |
 | TMEME/USDC 0.3% v3 pool | `0x47B8b6Ff9b32e51AE37e87Fad4E6489eB1B3e67D` |
 
-## Deploying Uniswap v3 to Arc testnet
+## Deploying to Arc testnet
+
+Arc testnet (chain 5042002) has Uniswap v4 (at the mainnet addresses) and Circle's USDC, which is also the gas token, but no Uniswap v3: `script/DeployUniswapV3.s.sol` deploys Uniswap's official v3 build there, and `DeployAbyssia` pins that copy. Fund the deployer from https://faucet.circle.com (Arc Testnet); the whole setup costs about 2 USDC of gas plus the pool seeds and any deposit. Pass the key through the environment; never commit it.
 
 ```sh
-DEPLOYER_PRIVATE_KEY=0x... forge script script/DeployUniswapV3.s.sol \
-  --rpc-url $ARC_TESTNET_RPC_URL --broadcast
+# 1. Uniswap v3 (once; DeployAbyssia already pins the copy below).
+forge script script/DeployUniswapV3.s.sol --tc DeployUniswapV3 --rpc-url $ARC_TESTNET_RPC_URL --broadcast --slow
+# 2. TMEME and its v3 + v4 USDC pools. Not TestPools: forge runs a script in a local EVM
+#    first, and Arc USDC's transfers need a precompile that EVM lacks, so this uses cast.
+SEED_USDC=1000000 script/arc-testnet-pools.sh
+# 3. Wait ~10 minutes for the v3 TWAP window, set ALLOW_TOKEN to the TMEME address, then:
+forge script script/DeployAbyssia.s.sol --tc DeployAbyssia --rpc-url $ARC_TESTNET_RPC_URL --broadcast --slow
+# 4. As guardian, post the v4 pool's first reference tick: postReferenceTick(poolId, tick).
 ```
 
-Pass the key through the environment; never commit it.
+Interacting with the vault (deposits, claims, keeper calls) also goes through `cast` on Arc, for the same reason.
+
+### Live on Arc testnet (2026-10-15, test settings)
+
+| Contract | Address |
+|---|---|
+| UniswapV3Factory (Abyssia's copy) | `0x6a87032589b837935b1A393Dc905c84E908c6974` |
+| NonfungiblePositionManager | `0x9c58491817B883840737aF8E49C92eDcFF4bFf40` |
+| SwapRouter02 | `0x13E4F948A7BF143482c2297B5Be1bc1Bc81EA8A6` |
+| TimelockController (5-minute delay) | `0xf06E5a17341c3b22d5E91FFDDf3750b57d94C1A2` |
+| VaultRegistry | `0x43e3D9C5f2C03401fA9f6B45892791d91E24c73e` |
+| AbyssiaVaultFactory | `0x9560FddE73DE03dcA7c9634C6803bE08225e3192` |
+| AbyssiaVault (abMEME) | `0x69add232784683b29408BfeD468cF973aD5ae12b` |
+| TMEME test token | `0xf783aB250a742c54451dfddD532048F57b040aA9` |
+| TMEME/USDC 0.3% v3 pool | `0x935cDc8809Ae548A099FB0a3167dBE909EeB2FAb` |
+| TMEME/USDC 0.3% v4 pool id | `0xb00a3c4b295e85c6aab8910a0f5027d5a350041ad3a0e5189006c6f9e52ff23a` |

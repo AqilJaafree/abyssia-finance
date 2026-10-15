@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {DeployAbyssia} from "../../script/DeployAbyssia.s.sol";
-import {SepoliaTestPools} from "../../script/SepoliaTestPools.s.sol";
+import {TestPools} from "../../script/TestPools.s.sol";
 import {AbyssiaVault} from "../../src/AbyssiaVault.sol";
 import {VaultRegistry} from "../../src/registry/VaultRegistry.sol";
 import {VaultBook} from "../../src/libraries/VaultBook.sol";
@@ -29,14 +29,14 @@ contract AbyssiaDeploySepoliaTest is Test {
 
     DeployAbyssia internal script;
     DeployAbyssia.Deployed internal d;
-    SepoliaTestPools.Pools internal pools;
+    TestPools.Pools internal pools;
     IERC20 internal usdc;
     address internal keeper = makeAddr("keeper");
     address internal guardian = makeAddr("guardian");
     address internal treasury = makeAddr("treasury");
     address internal proposer = makeAddr("proposer");
     bool internal forked;
-    SepoliaTestPools internal poolScript;
+    TestPools internal poolScript;
 
     function setUp() public {
         string memory url = vm.envOr("SEPOLIA_RPC_URL", string(""));
@@ -50,10 +50,10 @@ contract AbyssiaDeploySepoliaTest is Test {
         DeployAbyssia.Network memory n = script.network(block.chainid);
         usdc = IERC20(n.usdc);
 
-        poolScript = new SepoliaTestPools();
+        poolScript = new TestPools();
         vm.prank(DEPLOYER);
         usdc.transfer(address(poolScript), 4e6);
-        pools = poolScript.deployPools(2e6, address(poolScript));
+        pools = poolScript.deployPools(n, 2e6, address(poolScript));
         // Let the new v3 pool's TWAP window fill.
         vm.warp(block.timestamp + 11 minutes);
 
