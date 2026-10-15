@@ -22,7 +22,7 @@ pnpm lint      # lints every package
 
 ## abyssia-vault
 
-- `src/AbyssiaVault.sol`: the deployable vault. The keeper rebalances pools into liquidity shapes (Spot / Curve / Bid-Ask; hookless v4 pools only) and swaps within the registry's class limits, behind a tick band and v3 TWAP guards; a verified stop-loss, fee harvesting before each settlement, an in-kind exit that survives hostile tokens (IOUs), and ERC-7540 operators. Most logic lives in `src/libraries/`.
+- `src/AbyssiaVault.sol`: the deployable vault. The keeper rebalances pools into liquidity shapes (Spot / Curve / Bid-Ask; hookless v4 pools only) and swaps within the registry's class limits, behind a tick band and reference-price guards (the v3 TWAP, a posted reference tick for v4); a stop-loss priced at the reference, a guardian emergency unwind, fee harvesting before each settlement, an in-kind exit that survives hostile tokens (IOUs), and ERC-7540 operators. Most logic lives in `src/libraries/`.
 - `src/AbyssiaVaultFactory.sol`: deploys each vault from a timelock-approved hash of its code and constructor arguments, and lists them. Fees (15% performance on gains that hold through a 7-day period, optional management fee) are minted to the treasury.
 - `script/DeployAbyssia.s.sol` / `script/TestPools.s.sol`: timelocked deployment (Ethereum Sepolia, Arc testnet and Arc mainnet) and testnet pools (`script/arc-testnet-pools.sh` on Arc testnet).
 - `src/AsyncBatchVault.sol`: ERC-4626 USDC vault with batched async deposits/redemptions and an instant in-kind exit.
@@ -31,7 +31,9 @@ pnpm lint      # lints every package
 - `src/v4/V4Positions.sol`: Uniswap v4 position management through the PositionManager, paid via Permit2.
 - `script/DeployUniswapV3.s.sol`: deploys Uniswap v3 to Arc testnet, where it isn't officially deployed.
 
-Fork tests against Arc testnet/mainnet run only when `ARC_TESTNET_RPC_URL` / `ARC_MAINNET_RPC_URL` are set (see `abyssia-vault/.env.example`); otherwise they are skipped.
+Fork tests against Arc testnet, Arc mainnet and Ethereum Sepolia run only when `ARC_TESTNET_RPC_URL` / `ARC_MAINNET_RPC_URL` / `SEPOLIA_RPC_URL` are set (see `abyssia-vault/.env.example`); otherwise they are skipped.
+
+Deployed to testnets only, with test settings: Arc testnet (current code, smoke-tested with real USDC) and Ethereum Sepolia. Addresses and steps are in [`abyssia-vault/README.md`](./abyssia-vault/README.md#deploying-to-arc-testnet). Nothing is on Arc mainnet.
 
 ## Configuration
 

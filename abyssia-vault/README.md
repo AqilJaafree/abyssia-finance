@@ -2,7 +2,7 @@
 
 Solidity contracts for Abyssia's USDC liquidity vaults on Circle's Arc network. Depositors put in USDC; the vault provides concentrated liquidity to allowlisted Uniswap v3/v4 USDC pools.
 
-> **Status: work in progress, unaudited. Not deployed. Do not use with real funds.**
+> **Status: work in progress, unaudited. Deployed to testnets only ([Arc testnet](#live-on-arc-testnet-2026-10-15-test-settings), [Ethereum Sepolia](#live-on-sepolia-2026-10-14-test-settings)). Do not use with real funds.**
 
 ## Implemented so far
 
@@ -102,15 +102,15 @@ forge test --gas-report                            # gas usage per function
 
 | Path | Covers |
 |---|---|
-| `test/AsyncBatchVault.*.t.sol` | Deposits, redemptions, settlement and the price guard, in-kind exits, parameters, events, edge cases, hardening, fuzzing |
+| `test/AsyncBatchVault.*.t.sol` | Deposits, redemptions, settlement and the price guard, the pre-settlement batch lock, in-kind exits, parameters, events, edge cases, hardening, fuzzing |
 | `test/registry/` | Class parameters, pool allowlist, hardening, timelocked admin vs instant guardian |
 | `test/v3/` | v3 adapter against a real local Uniswap v3 deployment, in-kind exits with frozen and gas-burning tokens, fuzzing |
 | `test/v4/` | v4 adapter against Uniswap's official v4 bytecode deployed locally (PoolManager, PositionManager, StateView, Permit2), fee harvesting, in-kind exits with hostile tokens, fuzzing |
 | `test/libraries/` | `Shapes`: range placement and weights, with a layout-invariant fuzz test |
-| `test/vault/` | `AbyssiaVault` on local v3 + v4: rebalancing into shapes, cooldown, tick band and v3 TWAP guards, stop-loss, keeper operations and every registry check, swaps, settlement with fee harvesting, in-kind exits with hostile tokens and IOUs, worst-case exit gas at the position cap, operators, a smart account using every path, and a fuzz test that the books always match real balances |
-| `test/AsyncBatchVault.Fees.t.sol`, `test/AbyssiaVaultFactory.t.sol` | Fee math (high-water mark, per-second management fee, caps) and the factory's code-hash allowlist |
+| `test/vault/` | `AbyssiaVault` on local v3 + v4: rebalancing into shapes, cooldown, tick band and reference-price guards (v3 TWAP, v4 posted ticks), the observation floor, the reference-priced stop-loss and emergency unwind, keeper operations and every registry check, swaps, settlement with fee harvesting, in-kind exits with hostile tokens and IOUs, worst-case exit gas at the position cap, operators, a smart account using every path, and a fuzz test that the books always match real balances |
+| `test/AsyncBatchVault.Fees.t.sol`, `test/AbyssiaVaultFactory.t.sol` | Fee math (the performance-fee period on its sustained low, early charges at flows and fee changes, the management fee, `previewSettlePrice`) and the factory's per-vault init-hash approval, delist and relist |
 | `test/script/` | Pins the vendored SwapRouter02 bytecode hash |
-| `test/fork/` | Fork tests against Arc testnet and mainnet |
+| `test/fork/` | Fork tests against Arc testnet, Arc mainnet and Ethereum Sepolia |
 | `test/mocks/`, `test/harness/` | Mock tokens/pools and test harnesses |
 
 ### Fork tests
@@ -123,7 +123,7 @@ forge test --match-path "test/fork/*" -vv
 ```
 
 - `ARC_TESTNET_RPC_URL`: the registry, the v4 adapter and the vault end to end against the real Uniswap v4 deployment, and a rehearsal of the v3 deploy script.
-- `ARC_MAINNET_RPC_URL`: the v3 adapter against Uniswap's real v3 position manager and router.
+- `ARC_MAINNET_RPC_URL`: the v3 adapter against Uniswap's real v3 position manager and router, and the v4 adapter against the v4 contracts `DeployAbyssia` pins for Arc mainnet.
 - `SEPOLIA_RPC_URL`: both deployment scripts end to end on Ethereum Sepolia (real Uniswap v3/v4 and USDC), the timelock handover and delay, and a full vault lifecycle.
 
 Notes:
@@ -152,6 +152,8 @@ forge script script/DeployAbyssia.s.sol --tc DeployAbyssia \
 
 ### Live on Sepolia (2026-10-14, test settings)
 
+This vault predates the 6b hardening (fee period, reference prices, the new stop-loss); vaults are never upgraded, so it keeps that code. The Arc testnet vault runs the current code.
+
 | Contract | Address |
 |---|---|
 | TimelockController (5-minute delay) | `0x6dd5Cd6C23b41eeF17bB53cac670a5C36e9EA010` |
@@ -177,6 +179,8 @@ forge script script/DeployAbyssia.s.sol --tc DeployAbyssia --rpc-url $ARC_TESTNE
 ```
 
 Interacting with the vault (deposits, claims, keeper calls) also goes through `cast` on Arc, for the same reason.
+
+Smoke test on 2026-10-15, all on-chain with real Arc testnet USDC: guardian reference post, a 3 USDC deposit settled at 1.000000, a v4 Bid-Ask rebalance (4 ranges, 1.86M gas) and a v3 Spot rebalance (2 ranges, 1.71M gas), a keeper v3 swap, a simulated stop-loss on both pools (`StopLossNotReached`: unchanged value after an exit) and an in-kind exit of a third of the shares (1.07M gas). The whole setup cost about 3 USDC of gas.
 
 ### Live on Arc testnet (2026-10-15, test settings)
 
